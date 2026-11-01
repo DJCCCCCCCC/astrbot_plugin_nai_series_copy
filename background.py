@@ -96,7 +96,12 @@ class BackgroundQueue:
             }
             for i, payload in enumerate(payloads)
         ]
-        self.store.save_jobs(jobs)
+        daily_limit = (
+            0
+            if jobs[0].get("quota_exempt")
+            else max(0, int(self.config.get("daily_user_limit", 0)))
+        )
+        self.store.save_jobs(jobs, daily_limit)
         for job in jobs:
             self._spawn(job)
         return [job["id"] for job in jobs]

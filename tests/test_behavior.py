@@ -173,6 +173,9 @@ class Event:
     def get_sender_id(self):
         return self.user
 
+    def get_platform_name(self):
+        return "test"
+
     def is_admin(self):
         return True
 

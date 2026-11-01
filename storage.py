@@ -23,6 +23,10 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, owner TEXT NOT NULL, created REAL NOT NULL, value TEXT NOT NULL)"
             )
             db.execute("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS usage (job_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, day TEXT NOT NULL, status TEXT NOT NULL)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS usage_user_day ON usage(user_id, day)")
         self.database.chmod(0o600)
 
     @contextmanager
@@ -56,14 +60,36 @@ class Store:
                 "INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?)",
                 (job["id"], job["owner"], job["created"], json.dumps(job, ensure_ascii=False)),
             )
+            if job["state"] == "running":
+                db.execute("UPDATE usage SET status='running' WHERE job_id=?", (job["id"],))
+            elif job["state"] == "generated":
+                db.execute("UPDATE usage SET status='generated' WHERE job_id=?", (job["id"],))
+            elif job["state"] in {"failed", "cancelled"}:
+                db.execute("DELETE FROM usage WHERE job_id=? AND status='reserved'", (job["id"],))
 
-    def save_jobs(self, jobs):
+    def save_jobs(self, jobs, daily_limit=0):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if daily_limit and jobs[0].get("usage_user"):
+                used = db.execute(
+                    "SELECT COUNT(*) FROM usage WHERE user_id=? AND day=?",
+                    (jobs[0]["usage_user"], jobs[0]["usage_day"]),
+                ).fetchone()[0]
+                if used + len(jobs) > daily_limit:
+                    raise ValueError(f"今日生图额度不足，已使用或预留 {used}/{daily_limit} 张")
             db.executemany(
                 "INSERT INTO jobs VALUES (?, ?, ?, ?)",
                 [
                     (job["id"], job["owner"], job["created"], json.dumps(job, ensure_ascii=False))
                     for job in jobs
+                ],
+            )
+            db.executemany(
+                "INSERT INTO usage VALUES (?, ?, ?, 'reserved')",
+                [
+                    (job["id"], job["usage_user"], job["usage_day"])
+                    for job in jobs
+                    if job.get("usage_user")
                 ],
             )
 

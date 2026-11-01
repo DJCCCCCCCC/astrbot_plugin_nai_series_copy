@@ -7,12 +7,15 @@ import math
 import re
 import uuid
 from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.web import error_response, json_response
+from astrbot.api.web import request as web_request
 from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.star.filter.command import GreedyStr
@@ -52,7 +55,31 @@ class NaiSeriesPlugin(Star):
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_nai_series"))
         self.router = ProviderRouter(config)
         self.translator = PromptTranslator(config)
+        selected = self.store.get("routing_preferences", {})
+        if selected.get("translator") in self.translator.models:
+            self.translator.next_index = self.translator.models.index(selected["translator"])
+        for index, provider in enumerate(self.router.providers):
+            if provider.name == selected.get("image"):
+                self.router.next_index = index
         self.queue = BackgroundQueue(self.store, config, self._process_job, self._completed)
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/canvas/options",
+            self.canvas_options,
+            ["GET"],
+            "Get canvas options",
+        )
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/canvas/generate",
+            self.canvas_generate,
+            ["POST"],
+            "Generate an image",
+        )
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/canvas/task/<task_id>",
+            self.canvas_task,
+            ["GET"],
+            "Get an image task",
+        )
         self._tool_names = []
         changed = False
         for preset in config.get("presets", []):
@@ -285,9 +312,15 @@ class NaiSeriesPlugin(Star):
             height=height,
             steps=int(steps),
             scale=float(flags.get("scale", self.config.get(f"scale_{family}", 5))),
-            sampler=str(self.config.get(f"sampler_{family}", "k_euler_ancestral")),
-            noise_schedule=str(self.config.get(f"noise_schedule_{family}", "karras")),
-            cfg_rescale=float(self.config.get(f"cfg_rescale_{family}", 0)),
+            sampler=str(
+                flags.get("sampler", self.config.get(f"sampler_{family}", "k_euler_ancestral"))
+            ),
+            noise_schedule=str(
+                flags.get("noise_schedule", self.config.get(f"noise_schedule_{family}", "karras"))
+            ),
+            cfg_rescale=float(
+                flags.get("cfg_rescale", self.config.get(f"cfg_rescale_{family}", 0))
+            ),
             quality=False,
             action="img2img" if flags.get("img2img") else "generate",
             reference_id=flags.get("reference_id", ""),
@@ -358,6 +391,9 @@ class NaiSeriesPlugin(Star):
         payloads = [
             {
                 "owner": self._key(event),
+                "usage_user": f"{event.get_platform_name()}:{event.get_sender_id()}",
+                "usage_day": datetime.now().astimezone().date().isoformat(),
+                "quota_exempt": event.is_admin(),
                 "umo": event.unified_msg_origin,
                 "request": asdict(draft),
                 "original_prompt": prompt,
@@ -485,6 +521,136 @@ class NaiSeriesPlugin(Star):
         if matched is False:
             raise RuntimeError("platform_unavailable")
 
+    async def canvas_options(self):
+        """Return canvas settings without exposing credentials."""
+        if not web_request.username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        presets = self._load_presets()
+        families = {}
+        for family in ("nai4", "nai5"):
+            families[family] = {
+                "presets": [{"id": p.id, "name": p.name} for p in presets if p.family == family],
+                "default_preset": str(self.config.get(f"default_preset_{family}", "")),
+                "steps": self.config.get(f"steps_{family}", 28),
+                "scale": self.config.get(f"scale_{family}", 5),
+                "cfg_rescale": self.config.get(f"cfg_rescale_{family}", 0),
+                "sampler": self.config.get(f"sampler_{family}", "k_euler_ancestral"),
+                "noise_schedule": self.config.get(f"noise_schedule_{family}", "karras"),
+            }
+        return json_response(
+            {
+                "families": families,
+                "translator_enabled": self.translator.enabled,
+                "translators": [
+                    name for name, url, key, _ in self.translator.connections if url and key
+                ],
+            }
+        )
+
+    async def canvas_generate(self):
+        """Submit a dashboard image task."""
+        username = web_request.username
+        if not username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        data = await web_request.json(default={})
+        if not isinstance(data, dict):
+            return error_response("请求格式无效", status_code=400)
+        try:
+            prompt = data.get("prompt", "")
+            family = data.get("model", "nai4")
+            if (
+                not isinstance(prompt, str)
+                or not prompt.strip()
+                or len(prompt) > 12000
+                or family not in ("nai4", "nai5")
+            ):
+                raise ValueError("请输入描述并选择有效模型")
+            size = data.get("size", "1024x1024")
+            if size not in (
+                "1024x1024",
+                "768x1280",
+                "1280x768",
+                "1024x1536",
+                "1536x1024",
+                "832x1216",
+                "1216x832",
+            ):
+                raise ValueError("请选择有效尺寸")
+            model = self._model(family)
+            preset_id = data.get("preset", "")
+            if not isinstance(preset_id, str):
+                raise ValueError("预设无效")
+            preset = find_preset(self._load_presets(), preset_id, model) if preset_id else None
+            if preset_id and not preset:
+                raise ValueError("预设不存在或不属于当前模型")
+            translator = data.get("translator", "")
+            if not isinstance(translator, str) or (
+                translator and translator not in self.translator.models
+            ):
+                raise ValueError("翻译模型未配置")
+            flags = {"size": size}
+            for key in ("steps", "scale", "cfg_rescale", "sampler", "noise_schedule"):
+                if key in data:
+                    flags[key] = data[key]
+            for key in ("scale", "cfg_rescale"):
+                if key in flags and (
+                    isinstance(flags[key], bool) or not math.isfinite(float(flags[key]))
+                ):
+                    raise ValueError("CFG 参数必须是有效数字")
+            for key in ("sampler", "noise_schedule"):
+                if key in flags and (
+                    not isinstance(flags[key], str)
+                    or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", flags[key])
+                ):
+                    raise ValueError("采样器或噪声调度无效")
+            draft = self._request(model, prompt, preset, flags)
+            owner = "dashboard:" + hashlib.sha256(username.encode()).hexdigest()
+            task_id = self.queue.submit(
+                {
+                    "owner": owner,
+                    "usage_user": owner,
+                    "usage_day": datetime.now().astimezone().date().isoformat(),
+                    "quota_exempt": True,
+                    "umo": "",
+                    "request": asdict(draft),
+                    "original_prompt": prompt,
+                    "artist": preset.artist_prompt if preset else "",
+                    "translator": translator,
+                    "raw": bool(data.get("raw", False)),
+                    "silent": True,
+                    "preview": None,
+                    "batch_id": "",
+                    "batch_count": 1,
+                    "completion": None,
+                    "origin": "canvas",
+                }
+            )
+            return json_response({"id": task_id})
+        except (ValueError, TypeError, GenerationError) as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def canvas_task(self, task_id: str):
+        """Return the current dashboard task status and result."""
+        username = web_request.username
+        if not username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        owner = "dashboard:" + hashlib.sha256(username.encode()).hexdigest()
+        job = self.store.job(task_id, owner)
+        if not job or job.get("origin") != "canvas":
+            return error_response("任务不存在", status_code=404)
+        result = {
+            "state": job["state"],
+            "error": job.get("generation_error", "生成失败，请检查插件日志"),
+        }
+        if job["state"] in ("generated", "delivered"):
+            try:
+                result["image"] = base64.b64encode(
+                    await asyncio.to_thread(self.store.image_path(task_id).read_bytes)
+                ).decode()
+            except OSError:
+                return error_response("图片不可用", status_code=404)
+        return json_response(result)
+
     async def _process_job(self, job, queue):
         try:
             if job["state"] != "generated":
@@ -499,7 +665,14 @@ class NaiSeriesPlugin(Star):
                 queue.transition(job, "translating")
                 prompt = job["original_prompt"]
                 try:
-                    translated = prompt if job["raw"] else await self.translator.translate(prompt)
+                    if job["raw"]:
+                        translated = prompt
+                    elif job.get("translator"):
+                        translated = await self.translator.translate(
+                            prompt, start_model=job["translator"]
+                        )
+                    else:
+                        translated = await self.translator.translate(prompt)
                 except ValueError as exc:
                     # Translator errors contain a local summary, never an upstream body.
                     raise GenerationError(str(exc)) from None
@@ -544,6 +717,9 @@ class NaiSeriesPlugin(Star):
                         images[0].data,
                         self.store.preview_path(Preset(**job["preview"])),
                     )
+            if job.get("origin") == "canvas":
+                queue.transition(job, "delivered")
+                return
             image = await asyncio.to_thread(self.store.image_path(job["id"]).read_bytes)
             queue.transition(job, "sending")
             await self._send(job["umo"], [Image.fromBytes(image)])
@@ -794,6 +970,54 @@ class NaiSeriesPlugin(Star):
             self._persist(event, state)
         yield event.plain_result(
             f"/nai生图 当前模型: {self._model(state.model)}. /nai4 和 /nai5 始终使用各自模型配置."
+        )
+
+    @filter.command("nai翻译模型")
+    async def cmd_translator_model(self, event: AstrMessageEvent, value: GreedyStr = GreedyStr):
+        """Select the next translation model for all users."""
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可切换翻译模型")
+            return
+        value = str(value or "").strip()
+        if not value:
+            yield event.plain_result("翻译模型: " + ", ".join(self.translator.models))
+            return
+        if value not in self.translator.models:
+            yield event.plain_result("模型未配置，可用模型: " + ", ".join(self.translator.models))
+            return
+        self.translator.next_index = self.translator.models.index(value)
+        settings = self.store.get("routing_preferences", {})
+        settings["translator"] = value
+        self.store.put("routing_preferences", settings)
+        yield event.plain_result(f"下一次翻译将从 {value} 开始轮换")
+
+    @filter.command("nai线路")
+    async def cmd_route(self, event: AstrMessageEvent, value: GreedyStr = GreedyStr):
+        """Select the next image provider for all users."""
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可切换生图线路")
+            return
+        value = str(value or "").strip().lower()
+        names = [provider.name for provider in self.router.providers]
+        if value not in names:
+            yield event.plain_result("可用线路: " + (", ".join(names) or "无"))
+            return
+        self.router.next_index = names.index(value)
+        settings = self.store.get("routing_preferences", {})
+        settings["image"] = value
+        self.store.put("routing_preferences", settings)
+        yield event.plain_result(f"下一次生图将从 {value} 开始轮换")
+
+    @filter.command("nai排行")
+    async def cmd_ranking(self, event: AstrMessageEvent):
+        """Show the all-time count of successfully generated images."""
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT user_id, COUNT(*) AS total FROM usage WHERE status='generated' GROUP BY user_id ORDER BY total DESC, user_id LIMIT 10"
+            ).fetchall()
+        lines = [f"{i}. {user}: {count} 张" for i, (user, count) in enumerate(rows, 1)]
+        yield event.plain_result(
+            "NAI 生图排行榜（成功生成）\n" + ("\n".join(lines) if lines else "暂无记录")
         )
 
     @filter.command("nai状态")

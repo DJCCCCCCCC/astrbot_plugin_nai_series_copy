@@ -322,12 +322,86 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 await router.generate(REQUEST)
             second.generate.assert_not_awaited()
 
+    async def test_router_rotation_and_safe_fallback(self):
+        first = SimpleNamespace(name="primary", generate=AsyncMock(return_value=["a"]))
+        second = SimpleNamespace(name="secondary", generate=AsyncMock(return_value=["b"]))
+        router = ProviderRouter({})
+        router.providers = [first, second]
+        self.assertEqual((await router.generate(REQUEST))[1], "primary")
+        self.assertEqual((await router.generate(REQUEST))[1], "secondary")
+        first.generate.side_effect = GenerationError("unauthorized", status=401)
+        self.assertEqual((await router.generate(REQUEST))[1], "secondary")
+        router.next_index = 0
+        first.generate.side_effect = GenerationError("server error", status=500)
+        second.generate.reset_mock()
+        with self.assertRaises(GenerationError):
+            await router.generate(REQUEST)
+        second.generate.assert_not_awaited()
+
     def test_multiline_sse_and_malformed_encoding(self):
         body = b'event: message\ndata: {"data":\ndata: []}\n\ndata: [DONE]\n\n'
         self.assertEqual(openai_response_objects(body), [{"data": []}])
         for body in (b"\xff", b"data: []\n\n"):
             with self.assertRaisesRegex(GenerationError, "格式无法识别"):
                 openai_response_objects(body)
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_translation_models_rotate(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("cat"))
+        translator = PromptTranslator(
+            {
+                "translator_base_url": self.base_url,
+                "translator_api_key": "test",
+                "translator_model": "first",
+                "translator_models": ["second"],
+            }
+        )
+        await translator.translate("猫")
+        await translator.translate("猫")
+        self.assertEqual([req[1]["model"] for req in self.requests], ["first", "second"])
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_selected_translator_does_not_change_global_rotation(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("cat"))
+        translator = PromptTranslator(
+            {
+                "translator_base_url": self.base_url,
+                "translator_api_key": "key",
+                "translator_model": "first",
+                "translator_models": ["second"],
+            }
+        )
+        await translator.translate("猫", start_model="second")
+        await translator.translate("猫")
+        self.assertEqual([req[1]["model"] for req in self.requests], ["second", "first"])
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_translation_connection_fallback_uses_its_own_credentials(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("cat"))
+        translator = PromptTranslator(
+            {
+                "translator_base_url": "http://127.0.0.1:1",
+                "translator_api_key": "first-key",
+                "translator_model": "first",
+                "translator_connections": [
+                    {
+                        "name": "backup",
+                        "base_url": self.base_url,
+                        "api_key": "backup-key",
+                        "model": "second",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(await translator.translate("猫"), "cat")
+        self.assertEqual(self.requests[0][1]["model"], "second")
+        self.assertEqual(self.requests[0][2]["Authorization"], "Bearer backup-key")
 
     @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_translator_stream_switch_and_content_array(self):
@@ -390,6 +464,8 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 "未完整返回",
             ),
             ({"error": {"message": "fake-credential"}}, "上游错误"),
+            ({"choices": [{"message": {"content": "  ERROR: rejected"}}]}, "翻译模型返回错误"),
+            ({"choices": [{"message": {"content": "error: rejected"}}]}, "翻译模型返回错误"),
         ]
         for response, message in cases:
             self.set_json(response)

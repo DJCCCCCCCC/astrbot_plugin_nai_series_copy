@@ -512,6 +512,7 @@ class ProviderRouter:
     def __init__(self, config: dict[str, Any]):
         timeout = int(config.get("request_timeout", 300))
         self.providers = []
+        self.next_index = 0
         for name, key in (("primary", "primary"), ("secondary", "secondary"), ("third", "third")):
             url = str(config.get(f"{key}_base_url", "")).strip()
             api_key = str(config.get(f"{key}_api_key", "")).strip()
@@ -536,7 +537,10 @@ class ProviderRouter:
         if not self.providers:
             raise GenerationError("没有配置可用的 NAI 图片连接")
         errors: list[str] = []
-        for provider in self.providers:
+        start = self.next_index % len(self.providers)
+        self.next_index = (start + 1) % len(self.providers)
+        for offset in range(len(self.providers)):
+            provider = self.providers[(start + offset) % len(self.providers)]
             try:
                 return await provider.generate(request), provider.name
             except GenerationError as exc:

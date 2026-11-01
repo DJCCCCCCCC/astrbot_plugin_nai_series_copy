@@ -192,6 +192,23 @@ class PromptTranslator:
         self.base_url = str(config.get("translator_base_url", "")).rstrip("/")
         self.api_key = str(config.get("translator_api_key", ""))
         self.model = str(config.get("translator_model", "gpt-4o-mini"))
+        self.models = list(
+            dict.fromkeys(
+                [self.model]
+                + [str(m).strip() for m in config.get("translator_models", []) if str(m).strip()]
+            )
+        )
+        self.connections = [(name, self.base_url, self.api_key, name) for name in self.models]
+        for item in config.get("translator_connections", []):
+            if not isinstance(item, dict):
+                continue
+            name, url, key, model = (
+                str(item.get(k, "")).strip() for k in ("name", "base_url", "api_key", "model")
+            )
+            if name and url and key and model and name not in self.models:
+                self.models.append(name)
+                self.connections.append((name, url.rstrip("/"), key, model))
+        self.next_index = 0
         self.system_prompt = (
             str(config.get("translator_system_prompt", "")).strip() or DEFAULT_TRANSLATOR_PROMPT
         )
@@ -226,18 +243,15 @@ class PromptTranslator:
         content = "".join(parts).strip()
         if not recognized or not content:
             raise GenerationError("翻译接口返回里没有文本")
+        if content.casefold().startswith("error"):
+            raise GenerationError("翻译模型返回错误")
         return content.replace("\n", ", ")
 
-    async def translate(self, text: str) -> str:
+    async def translate(self, text: str, start_model: str = "") -> str:
         if not self.enabled or not has_chinese(text):
             return text
-        if not self.base_url or not self.api_key:
+        if not any(url and key for _, url, key, _ in self.connections):
             raise ValueError("翻译接口未配置, 请配置翻译模型或使用 --raw")
-        url = (
-            f"{self.base_url}/chat/completions"
-            if self.base_url.endswith("/v1")
-            else f"{self.base_url}/v1/chat/completions"
-        )
         payload = {
             "model": self.model,
             "messages": [
@@ -248,24 +262,41 @@ class PromptTranslator:
             "max_tokens": 1500,
             "stream": self.use_stream,
         }
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as session:
-                async with session.post(url, json=payload, headers=headers) as response:
-                    body = await read_limited(response, 2 * 1024 * 1024)
-                    if response.status != 200:
-                        raise GenerationError(f"翻译接口 HTTP {response.status}")
-                    return self._parse_response(body, response.headers.get("content-type", ""))
-        except asyncio.TimeoutError as exc:
-            reason = "翻译请求超时"
-            error = exc
-        except aiohttp.ClientError as exc:
-            reason = "翻译网络请求失败"
-            error = exc
-        except GenerationError as exc:
-            reason = exc.message
-            error = exc
-        logger.warning("[NaiSeries] 翻译失败 (%s)", type(error).__name__)
+        if start_model:
+            if start_model not in self.models:
+                raise ValueError("翻译模型未配置; 未发起付费生图")
+            start = self.models.index(start_model)
+        else:
+            start = self.next_index % len(self.models)
+            self.next_index = (start + 1) % len(self.models)
+        reason = "翻译失败"
+        for offset in range(len(self.models)):
+            name, base_url, api_key, model = self.connections[(start + offset) % len(self.models)]
+            if not base_url or not api_key:
+                continue
+            payload["model"] = model
+            url = (
+                f"{base_url}/chat/completions"
+                if base_url.endswith("/v1")
+                else f"{base_url}/v1/chat/completions"
+            )
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as session:
+                    async with session.post(url, json=payload, headers=headers) as response:
+                        body = await read_limited(response, 2 * 1024 * 1024)
+                        if response.status != 200:
+                            raise GenerationError(f"翻译接口 HTTP {response.status}")
+                        return self._parse_response(body, response.headers.get("content-type", ""))
+            except asyncio.TimeoutError:
+                reason = "翻译请求超时"
+            except aiohttp.ClientError:
+                reason = "翻译网络请求失败"
+            except GenerationError as exc:
+                reason = exc.message
+                if reason == "翻译模型返回错误":
+                    break
+            logger.warning("[NaiSeries] Translation failed for connection %s", name)
         raise ValueError(f"{reason}; 未发起付费生图, 请检查翻译模型或使用 --raw") from None

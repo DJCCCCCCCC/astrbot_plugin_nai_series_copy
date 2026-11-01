@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NAI 生图画布</title><link rel="stylesheet" href="./style.css"></head>
+<body>
+  <main>
+    <header><h1>生图画布</h1><p>描述画面，选择模型与尺寸，生成结果会显示在右侧。</p></header>
+    <div class="workspace">
+      <form id="form">
+        <label for="prompt">画面描述</label>
+        <textarea id="prompt" maxlength="12000" required placeholder="描述你想生成的画面"></textarea>
+        <div class="fields"><div><label for="model">模型</label><select id="model"><option value="nai4">NAI 4.5</option><option value="nai5">NAI 5</option></select></div>
+        <div><label for="size">尺寸</label><select id="size"><option>1024x1024</option><option>768x1280</option><option>1280x768</option><option>1024x1536</option><option>1536x1024</option><option>832x1216</option><option>1216x832</option></select></div></div>
+        <div class="fields"><div><label for="preset">画师预设</label><select id="preset"><option value="">不使用预设</option></select></div><div><label for="translator">翻译模型</label><select id="translator"><option value="">自动轮换</option></select></div></div>
+        <div class="fields"><div><label for="steps">步数</label><input type="number" id="steps" min="1" max="28" step="1" required></div><div><label for="scale">CFG</label><input type="number" id="scale" min="1" max="20" step="0.1" required></div></div>
+        <details><summary>更多参数</summary><div class="fields"><div><label for="sampler">采样器</label><input id="sampler" maxlength="80" pattern="[a-zA-Z0-9_-]+" required></div><div><label for="noise_schedule">噪声调度</label><input id="noise_schedule" maxlength="80" pattern="[a-zA-Z0-9_-]+" required></div></div><div class="fields"><div><label for="cfg_rescale">CFG Rescale</label><input type="number" id="cfg_rescale" min="0" max="20" step="0.1" required></div></div></details>
+        <label class="check"><input type="checkbox" id="raw"> 使用原文，不翻译</label>
+        <button id="submit" type="submit">生成图片</button>
+        <p class="note">提交后会调用已配置的生图接口，可能产生费用。</p>
+        <p id="status" role="status" aria-live="polite"></p>
+      </form>
+      <section class="preview" aria-label="生成结果"><div id="empty"><strong>生成结果</strong><p>图片将在这里显示</p></div><a id="download" download="nai-image.png" hidden>下载图片</a></section>
+    </div>
+  </main><script type="module" src="./app.js"></script>
+</body></html>

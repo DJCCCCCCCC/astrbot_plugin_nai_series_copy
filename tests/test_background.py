@@ -1,11 +1,12 @@
 """Lifecycle, admission, snapshots and real AstrBot silent tool execution."""
 
 import asyncio
+import json
 import time
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import test_behavior as behavior
 from astrbot_plugin_nai_series.background import BackgroundQueue
@@ -22,6 +23,109 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = behavior.PluginTests.asyncTearDown
     finish = behavior.PluginTests.finish
     execute = behavior.PluginTests.execute
+
+    async def test_canvas_task_uses_queue_and_is_isolated_by_user(self):
+        request = SimpleNamespace(
+            username="alice",
+            json=AsyncMock(return_value={"prompt": "cat", "model": "nai4", "size": "768x1280"}),
+        )
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            response = await self.plugin.canvas_generate()
+            task_id = json.loads(response.body)["id"]
+            await self.finish()
+            result = json.loads((await self.plugin.canvas_task(task_id)).body)
+            self.assertEqual(result["state"], "delivered")
+            self.assertTrue(result["image"])
+            self.plugin.context.send_message.assert_not_awaited()
+            request.username = "bob"
+            self.assertEqual((await self.plugin.canvas_task(task_id)).status_code, 404)
+
+    async def test_requested_sizes_are_accepted(self):
+        for size in ("1024x1024", "768x1280", "1280x768", "1024x1536", "1536x1024"):
+            with self.subTest(size=size):
+                draft = self.plugin._request("nai-diffusion-4-5-full", "cat", None, {"size": size})
+                self.assertEqual(draft.size, size)
+
+    async def test_canvas_uses_selected_preset_translation_and_parameters(self):
+        self.plugin.translator.translate = AsyncMock(return_value="translated cat")
+        self.plugin.translator.models = ["backup"]
+        request = SimpleNamespace(
+            username="alice",
+            json=AsyncMock(
+                return_value={
+                    "prompt": "猫",
+                    "model": "nai4",
+                    "size": "1024x1024",
+                    "preset": "A",
+                    "translator": "backup",
+                    "steps": 17,
+                    "scale": 7,
+                    "cfg_rescale": 0.5,
+                    "sampler": "k_euler",
+                    "noise_schedule": "native",
+                }
+            ),
+        )
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            response = await self.plugin.canvas_generate()
+            self.assertEqual(response.status_code, 200)
+            await self.finish()
+            self.plugin.translator.translate.assert_awaited_once_with("猫", start_model="backup")
+            generated = self.plugin.router.generate.await_args.args[0]
+            self.assertEqual(generated.prompt, "style4, translated cat")
+            self.assertEqual(generated.negative_prompt, "bad4")
+            self.assertEqual(
+                (generated.steps, generated.scale, generated.cfg_rescale), (17, 7, 0.5)
+            )
+            self.assertEqual((generated.sampler, generated.noise_schedule), ("k_euler", "native"))
+            request.json.return_value["preset"] = "B"
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 400)
+            request.json.return_value.update(preset="A", scale="nan")
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 400)
+
+    async def test_daily_quota_reserves_batch_and_releases_translation_failure(self):
+        self.plugin.config.update(daily_user_limit=2, max_user_tasks=4, batch_max_count=4)
+        self.plugin.translator.translate = AsyncMock(side_effect=ValueError("blocked"))
+        event = Event()
+        event.is_admin = lambda: False
+        self.plugin._submit(event, "nai-diffusion-5-full", "猫", count=2)
+        with self.assertRaisesRegex(ValueError, "额度不足"):
+            self.plugin._submit(event, "nai-diffusion-5-full", "猫")
+        await self.finish()
+        with self.plugin.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 0)
+        self.plugin.translator.translate = AsyncMock(return_value="cat")
+        self.plugin._submit(event, "nai-diffusion-5-full", "猫")
+        await self.finish()
+        with self.plugin.store.connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM usage").fetchone()[0], "generated")
+        result = [item async for item in self.plugin.cmd_ranking(event)]
+        self.assertIn("test:1: 1 张", result[0])
+
+    async def test_admin_bypasses_daily_quota_but_is_counted(self):
+        self.plugin.config.update(daily_user_limit=1, max_user_tasks=4, batch_max_count=4)
+        admin = Event("admin")
+        self.plugin._submit(admin, "nai-diffusion-5-full", "cat", count=2)
+        await self.finish()
+        self.plugin._submit(admin, "nai-diffusion-5-full", "cat")
+        await self.finish()
+        with self.plugin.store.connect() as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM usage WHERE user_id=? AND status='generated'",
+                    ("test:admin",),
+                ).fetchone()[0],
+                3,
+            )
+        result = [item async for item in self.plugin.cmd_ranking(admin)]
+        self.assertIn("test:admin: 3 张", result[0])
+
+        user = Event("user")
+        user.is_admin = lambda: False
+        self.plugin._submit(user, "nai-diffusion-5-full", "cat")
+        with self.assertRaisesRegex(ValueError, "额度不足"):
+            self.plugin._submit(user, "nai-diffusion-5-full", "cat")
+        await self.finish()
 
     async def test_batch_atomic_limits_and_concurrent_delivery(self):
         self.plugin.config.update(max_user_tasks=4, queue_limit=4, batch_max_count=4)
