@@ -4,7 +4,7 @@ desc: NAI 4.5 / NAI 5 文生图与图生图, 支持附图、引用图和 LLM 工
 short_desc: 模型和预设分离的 Nai 系列生图插件.
 version: 1.4.1
 author: 木有知
-repo: https://github.com/muyouzhi6/astrbot_plugin_nai_series
+repo: https://github.com/DJCCCCCCCC/astrbot_plugin_nai_series_copy
 tags:
   - image
   - novelai

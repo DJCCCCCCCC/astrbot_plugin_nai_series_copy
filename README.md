@@ -1,5 +1,7 @@
 # Nai系列生图
 
+本仓库基于[原版插件](https://github.com/muyouzhi6/astrbot_plugin_nai_series)修改，保留原作者署名。
+
 给 AstrBot 使用的 NAI 4.5 / NAI 5 生图插件. 两套模型拥有独立的画师串、负面词、默认预设和生成参数, 可以在同一个会话交替使用. 支持批量并发后台生图, 完成后按原有人格继续对话.
 
 ## 开始使用
