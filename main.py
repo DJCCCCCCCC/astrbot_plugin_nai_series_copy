@@ -7,7 +7,7 @@ import math
 import re
 import uuid
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import logger
@@ -41,6 +41,8 @@ from .translator import PromptTranslator
 NAI_TOOLS = tuple(
     f"{family}_{mode}_image" for family in ("nai4", "nai5") for mode in ("generate", "edit")
 )
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+TRANSLATION_IMAGE_THRESHOLD = 300
 
 
 class BatchCommandWakeFilter(filter.CustomFilter):
@@ -692,7 +694,27 @@ class NaiSeriesPlugin(Star):
                     and translated != prompt
                     and self.config.get("show_translated_prompt", False)
                 ):
-                    await self._send(job["umo"], [Plain(f"翻译: {translated}")])
+                    components = [Plain(f"翻译: {translated}")]
+                    if (
+                        self.config.get("send_text_as_image", True)
+                        and len(translated) > TRANSLATION_IMAGE_THRESHOLD
+                    ):
+                        try:
+                            image_path = await asyncio.wait_for(
+                                self.html_render(
+                                    (TEMPLATE_DIR / "translation.html").read_text(encoding="utf-8"),
+                                    {"translation": translated},
+                                    return_url=False,
+                                    umo=job["umo"],
+                                ),
+                                timeout=20,
+                            )
+                            components = [Image.fromFileSystem(image_path)]
+                        except Exception as exc:
+                            logger.warning(
+                                "[NaiSeries] translation render failed: %s", type(exc).__name__
+                            )
+                    await self._send(job["umo"], components)
                 queue.transition(job, "running", request=asdict(request))
                 outbound = (
                     replace(request, image=base64.b64encode(reference).decode())
@@ -1009,16 +1031,60 @@ class NaiSeriesPlugin(Star):
         yield event.plain_result(f"下一次生图将从 {value} 开始轮换")
 
     @filter.command("nai排行")
-    async def cmd_ranking(self, event: AstrMessageEvent):
-        """Show the all-time count of successfully generated images."""
+    async def cmd_ranking(self, event: AstrMessageEvent, period: str = "总"):
+        """Show daily, weekly or all-time counts of successfully generated images."""
+        periods = {
+            "日": "日榜",
+            "今日": "日榜",
+            "日榜": "日榜",
+            "周": "周榜",
+            "本周": "周榜",
+            "周榜": "周榜",
+            "总": "总榜",
+            "总榜": "总榜",
+        }
+        label = periods.get(period.strip())
+        if not label:
+            yield event.plain_result("用法: /nai排行 日、/nai排行 周 或 /nai排行 总")
+            return
+        today = datetime.now().astimezone().date()
+        query = "SELECT user_id, COUNT(*) AS total FROM usage WHERE status='generated'"
+        args = ()
+        if label == "日榜":
+            query += " AND day = ?"
+            args = (today.isoformat(),)
+        elif label == "周榜":
+            query += " AND day >= ? AND day <= ?"
+            args = ((today - timedelta(days=today.weekday())).isoformat(), today.isoformat())
+        query += " GROUP BY user_id ORDER BY total DESC, user_id LIMIT 10"
         with self.store.connect() as db:
-            rows = db.execute(
-                "SELECT user_id, COUNT(*) AS total FROM usage WHERE status='generated' GROUP BY user_id ORDER BY total DESC, user_id LIMIT 10"
-            ).fetchall()
+            rows = db.execute(query, args).fetchall()
         lines = [f"{i}. {user}: {count} 张" for i, (user, count) in enumerate(rows, 1)]
-        yield event.plain_result(
-            "NAI 生图排行榜（成功生成）\n" + ("\n".join(lines) if lines else "暂无记录")
-        )
+        text = f"NAI 生图{label}（成功生成）\n" + ("\n".join(lines) if lines else "暂无记录")
+        if not self.config.get("send_text_as_image", True):
+            yield event.plain_result(text)
+            return
+        try:
+            image_path = await asyncio.wait_for(
+                self.html_render(
+                    (TEMPLATE_DIR / "ranking.html").read_text(encoding="utf-8"),
+                    {
+                        "label": label,
+                        "rows": [
+                            {"rank": i, "user": user, "count": count}
+                            for i, (user, count) in enumerate(rows, 1)
+                        ],
+                    },
+                    return_url=False,
+                    umo=event.unified_msg_origin,
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            logger.warning("[NaiSeries] ranking render failed: %s", type(exc).__name__)
+            yield event.plain_result(text)
+            return
+        yield event.image_result(image_path)
 
     @filter.command("nai状态")
     async def cmd_status(self, event: AstrMessageEvent):
@@ -1106,6 +1172,7 @@ class NaiSeriesPlugin(Star):
             "/nai4、/nai5、/nai生图: 有附图或引用图自动图生图, 无图文生图\n"
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"
+            "/nai排行 日|周|总: 查看生图排行榜，默认总榜\n"
             "Nai系列生图\n/nai4 描述 或 /nai5 描述\n批量: /3nai4 描述 或 /3nai5 描述\n选项放描述后: --count 3 --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 

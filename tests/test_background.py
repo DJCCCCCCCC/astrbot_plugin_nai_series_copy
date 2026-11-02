@@ -5,6 +5,7 @@ import json
 import time
 import unittest
 from dataclasses import asdict
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -101,6 +102,102 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT status FROM usage").fetchone()[0], "generated")
         result = [item async for item in self.plugin.cmd_ranking(event)]
         self.assertIn("test:1: 1 张", result[0])
+
+    async def test_ranking_renders_escaped_html_and_falls_back(self):
+        from jinja2 import Template
+
+        event = Event()
+        self.plugin.html_render = AsyncMock(return_value="ranking.png")
+        event.image_result = lambda path: ("image", path)
+        result = [item async for item in self.plugin.cmd_ranking(event)]
+        self.assertEqual(result, [("image", "ranking.png")])
+        args, kwargs = self.plugin.html_render.await_args
+        self.assertIn("暂无记录", Template(args[0]).render(**args[1]))
+        self.assertEqual(kwargs, {"return_url": False, "umo": event.unified_msg_origin})
+        html = Template(args[0]).render(rows=[{"rank": 1, "user": "<script>", "count": 2}])
+        self.assertIn("&lt;script&gt;", html)
+        self.plugin.html_render.side_effect = RuntimeError("unavailable")
+        result = [item async for item in self.plugin.cmd_ranking(event)]
+        self.assertIn("暂无记录", result[0])
+
+    async def test_translation_image_threshold_and_fallback(self):
+        from astrbot.api.message_components import Image, Plain
+        from jinja2 import Template
+
+        self.plugin.config["show_translated_prompt"] = True
+        self.plugin.html_render = AsyncMock(return_value="translation.png")
+        self.plugin.translator.translate = AsyncMock(return_value="<script>" + "a" * 300)
+        event = Event()
+        await self.execute(event, "nai-diffusion-5-full", "猫")
+        args, kwargs = self.plugin.html_render.await_args
+        self.assertIn("&lt;script&gt;", Template(args[0]).render(**args[1]))
+        self.assertEqual(kwargs, {"return_url": False, "umo": event.unified_msg_origin})
+        self.assertIsInstance(
+            self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Image
+        )
+        self.plugin.context.send_message.reset_mock()
+        self.plugin.html_render.reset_mock()
+        self.plugin.translator.translate.return_value = "a" * 300
+        await self.execute(event, "nai-diffusion-5-full", "猫")
+        self.plugin.html_render.assert_not_awaited()
+        self.assertIsInstance(
+            self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
+        )
+        self.plugin.context.send_message.reset_mock()
+        self.plugin.html_render.side_effect = RuntimeError("unavailable")
+        self.plugin.translator.translate.return_value = "a" * 301
+        await self.execute(event, "nai-diffusion-5-full", "猫")
+        self.assertIsInstance(
+            self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
+        )
+        self.assertEqual(self.plugin.router.generate.await_count, 3)
+        self.plugin.context.send_message.reset_mock()
+        self.plugin.html_render.reset_mock(side_effect=True)
+        self.plugin.config["send_text_as_image"] = False
+        await self.execute(event, "nai-diffusion-5-full", "猫")
+        self.plugin.html_render.assert_not_awaited()
+        self.assertIsInstance(
+            self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
+        )
+
+    async def test_ranking_periods_and_image_setting(self):
+        event = Event()
+        self.plugin.config["send_text_as_image"] = False
+        self.plugin.html_render = AsyncMock()
+        with self.plugin.store.connect() as db:
+            db.executemany(
+                "INSERT INTO usage VALUES (?, ?, ?, ?)",
+                [
+                    ("1", "user", "2026-10-31", "generated"),
+                    ("2", "user", "2026-11-01", "generated"),
+                    ("3", "user", "2026-11-02", "generated"),
+                    ("4", "user", "2026-11-04", "generated"),
+                    ("5", "user", "2026-11-05", "generated"),
+                    ("6", "user", "2026-11-04", "reserved"),
+                ],
+            )
+        with patch("astrbot_plugin_nai_series.main.datetime") as clock:
+            clock.now.return_value.astimezone.return_value.date.return_value = date(2026, 11, 4)
+            for period, label, count in (
+                ("日", "日榜", 1),
+                ("周", "周榜", 2),
+                ("总", "总榜", 5),
+                ("", "总榜", 5),
+            ):
+                with self.subTest(period=period):
+                    results = [
+                        item
+                        async for item in (
+                            self.plugin.cmd_ranking(event, period)
+                            if period
+                            else self.plugin.cmd_ranking(event)
+                        )
+                    ]
+                    self.assertIn(label, results[0])
+                    self.assertIn(f"user: {count} 张", results[0])
+            result = [item async for item in self.plugin.cmd_ranking(event, "年")]
+            self.assertIn("用法", result[0])
+        self.plugin.html_render.assert_not_awaited()
 
     async def test_admin_bypasses_daily_quota_but_is_counted(self):
         self.plugin.config.update(daily_user_limit=1, max_user_tasks=4, batch_max_count=4)

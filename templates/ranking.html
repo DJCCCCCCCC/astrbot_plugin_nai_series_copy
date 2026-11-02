@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 32px; background: #e9eeec; color: #182824; font-family: "Microsoft YaHei", sans-serif; }
+main { width: 660px; padding: 36px; background: #fff; border-top: 8px solid #2f806b; }
+.eyebrow { color: #537970; font-size: 14px; font-weight: bold; }
+h1 { margin: 12px 0 8px; font-size: 32px; }
+.subtitle { margin-bottom: 24px; color: #75827e; font-size: 15px; }
+.row { display: flex; align-items: center; min-height: 52px; border-top: 1px solid #e8edeb; }
+.rank { width: 54px; color: #bd7a3a; font-weight: bold; font-size: 21px; }
+.user { flex: 1; overflow-wrap: anywhere; font-size: 17px; }
+.count { padding-left: 18px; font-size: 17px; font-weight: bold; white-space: nowrap; }
+.empty { padding: 24px 0; color: #75827e; }
+</style>
+</head>
+<body><main>
+<div class="eyebrow">NAI IMAGE GENERATION</div>
+<h1>生图{{ label | e }}</h1>
+<div class="subtitle">按成功生成的图片数量统计 · 前 10 名</div>
+{% for row in rows %}
+<div class="row"><div class="rank">{{ row.rank }}</div><div class="user">{{ row.user | e }}</div><div class="count">{{ row.count }} 张</div></div>
+{% else %}<div class="empty">暂无记录</div>{% endfor %}
+</main></body></html>
