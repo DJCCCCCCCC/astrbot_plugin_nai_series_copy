@@ -155,6 +155,7 @@ class Store:
                     ("completion:" + (job.get("batch_id") or job["id"]),),
                 )
         keep = {j.get("request", {}).get("reference_id") for j in self.jobs()}
+        keep.update(j.get("vision_reference_id") for j in self.jobs())
         with self.connect() as db:
             for (value,) in db.execute("SELECT value FROM state"):
                 state = json.loads(value)

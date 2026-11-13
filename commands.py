@@ -5,9 +5,7 @@ import re
 
 def generation_args(text):
     flags = {}
-    pattern = (
-        r"(?:^|\s)--(raw|img2img|preset|model|size|steps|scale|count|strength|noise|image)(?=\s|$)"
-    )
+    pattern = r"(?:^|\s)--(raw|img2img|preset|model|size|steps|scale|count|strength|noise|image|route)(?=\s|$)"
     matches = list(re.finditer(pattern, text))
     if not matches:
         return text.strip(), flags

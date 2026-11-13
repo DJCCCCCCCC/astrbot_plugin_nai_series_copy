@@ -114,7 +114,9 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = self.plugin.html_render.await_args
         self.assertIn("暂无记录", Template(args[0]).render(**args[1]))
         self.assertEqual(kwargs, {"return_url": False, "umo": event.unified_msg_origin})
-        html = Template(args[0]).render(rows=[{"rank": 1, "user": "<script>", "count": 2}])
+        html = Template(args[0]).render(
+            rows=[{"rank": 1, "user": "<script>", "count": 2}], maximum=2
+        )
         self.assertIn("&lt;script&gt;", html)
         self.plugin.html_render.side_effect = RuntimeError("unavailable")
         result = [item async for item in self.plugin.cmd_ranking(event)]
@@ -140,6 +142,7 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.translator.translate.return_value = "a" * 300
         await self.execute(event, "nai-diffusion-5-full", "猫")
         self.plugin.html_render.assert_not_awaited()
+
         self.assertIsInstance(
             self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
         )
@@ -159,6 +162,54 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(
             self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
         )
+
+    async def test_library_requires_login_and_isolates_canvas_users(self):
+        request = SimpleNamespace(
+            username="alice", json=AsyncMock(return_value={"prompt": "猫", "model": "nai4"})
+        )
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            result = await self.plugin.canvas_generate()
+            self.assertEqual(result.status_code, 200)
+            await self.finish()
+            data = json.loads((await self.plugin.library()).body)
+            self.assertEqual(len(data["images"]), 1)
+            request.username = "bob"
+            data = json.loads((await self.plugin.library()).body)
+            self.assertEqual(data["images"], [])
+            request.username = ""
+            self.assertEqual((await self.plugin.library()).status_code, 401)
+
+    async def test_nickname_and_independent_image_settings(self):
+        from astrbot.api.message_components import Image
+
+        event = Event()
+        event.get_sender_name = lambda: "昵称"
+        self.plugin.config.update(
+            show_translated_prompt=True,
+            ranking_as_image=False,
+            translation_as_image=True,
+            translation_image_threshold=4,
+        )
+        self.plugin.translator.translate = AsyncMock(return_value="abcdef")
+        self.plugin.html_render = AsyncMock(return_value="translation.png")
+        await self.execute(event, "nai-diffusion-5-full", "猫")
+        self.assertIsInstance(
+            self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Image
+        )
+        result = [item async for item in self.plugin.cmd_ranking(event)]
+        self.assertIn("昵称 (1)", result[0])
+        self.plugin.html_render.assert_awaited_once()
+
+    async def test_explicit_route_is_per_task(self):
+        self.plugin.router.providers = [
+            SimpleNamespace(name="primary"),
+            SimpleNamespace(name="secondary"),
+        ]
+        event = Event()
+        await self.execute(event, "nai-diffusion-5-full", "猫", flags={"route": "secondary"})
+        self.assertEqual(self.plugin.router.generate.await_args.kwargs["start_route"], "secondary")
+        with self.assertRaisesRegex(ValueError, "可用线路"):
+            self.plugin._submit(event, "nai-diffusion-5-full", "猫", flags={"route": "missing"})
 
     async def test_ranking_periods_and_image_setting(self):
         event = Event()

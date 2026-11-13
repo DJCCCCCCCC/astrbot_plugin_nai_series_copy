@@ -9,9 +9,13 @@ main { width: 660px; padding: 36px; background: #fff; border-top: 8px solid #2f8
 .eyebrow { color: #537970; font-size: 14px; font-weight: bold; }
 h1 { margin: 12px 0 8px; font-size: 32px; }
 .subtitle { margin-bottom: 24px; color: #75827e; font-size: 15px; }
-.row { display: flex; align-items: center; min-height: 52px; border-top: 1px solid #e8edeb; }
+.row { display: flex; align-items: center; min-height: 74px; border-top: 1px solid #e8edeb; gap: 12px; }
 .rank { width: 54px; color: #bd7a3a; font-weight: bold; font-size: 21px; }
-.user { flex: 1; overflow-wrap: anywhere; font-size: 17px; }
+.avatar { width: 42px; height: 42px; border-radius: 50%; background: #e8eeeb; object-fit: cover; }
+.user { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 17px; }
+.id { color: #75827e; font-size: 13px; }
+.track { height: 7px; margin-top: 8px; background: #e8eeeb; border-radius: 4px; overflow: hidden; }
+.bar { height: 100%; background: #2f806b; border-radius: 4px; }
 .count { padding-left: 18px; font-size: 17px; font-weight: bold; white-space: nowrap; }
 .empty { padding: 24px 0; color: #75827e; }
 </style>
@@ -21,6 +25,6 @@ h1 { margin: 12px 0 8px; font-size: 32px; }
 <h1>生图{{ label | e }}</h1>
 <div class="subtitle">按成功生成的图片数量统计 · 前 10 名</div>
 {% for row in rows %}
-<div class="row"><div class="rank">{{ row.rank }}</div><div class="user">{{ row.user | e }}</div><div class="count">{{ row.count }} 张</div></div>
+<div class="row"><div class="rank">{{ row.rank }}</div>{% if row.avatar %}<img class="avatar" src="{{ row.avatar | e }}" alt="">{% else %}<div class="avatar"></div>{% endif %}<div class="user">{{ (row.nickname or row.user) | e }}<div class="id">{{ row.id | e }}</div><div class="track"><div class="bar" style="width: {{ (row.count * 100 / maximum)|round(1) }}%"></div></div></div><div class="count">{{ row.count }} 张</div></div>
 {% else %}<div class="empty">暂无记录</div>{% endfor %}
 </main></body></html>

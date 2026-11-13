@@ -118,7 +118,7 @@ async def _expand(event, scanned, strict=False):
     return result
 
 
-async def collect_images(event, *, strict=False, fetch_current=True):
+async def collect_images(event, *, strict=False, fetch_current=True, reply_only=False):
     message = getattr(event, "message_obj", None)
     getter = getattr(event, "get_messages", None)
     chain = getter() if callable(getter) else getattr(message, "message", [])
@@ -127,7 +127,9 @@ async def collect_images(event, *, strict=False, fetch_current=True):
     # Prefer original platform references when another plugin replaced temp paths.
     embedded = {str(key): chain for key, chain in current[1] if chain}
     replies = [(key, chain or embedded.get(str(key))) for key, chain in (raw[1] or current[1])]
-    combined = (raw[0] or current[0], replies, raw[2] or current[2])
+    combined = (
+        ([], replies, []) if reply_only else (raw[0] or current[0], replies, raw[2] or current[2])
+    )
     result = await _expand(event, combined, strict=strict)
     if fetch_current and not result and getattr(message, "message_id", None):
         fetched = await _action(event, "get_msg", message_id=message.message_id)

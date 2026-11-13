@@ -82,6 +82,9 @@ class NaiSeriesPlugin(Star):
             ["GET"],
             "Get an image task",
         )
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/library", self.library, ["GET"], "Get library data"
+        )
         self._tool_names = []
         changed = False
         for preset in config.get("presets", []):
@@ -330,9 +333,27 @@ class NaiSeriesPlugin(Star):
             noise=float(flags.get("noise", 0.1)),
         )
 
-    async def _reference_flags(self, event, model, prompt, flags):
+    async def _reference_flags(self, event, model, prompt, flags, describe_reply=False):
         self._check_access(event)
         candidates = None
+        if describe_reply and not any(flags.get(key) for key in ("img2img", "strength", "noise")):
+            try:
+                async with asyncio.timeout(30):
+                    quoted = await collect_images(
+                        event, strict=True, fetch_current=False, reply_only=True
+                    )
+            except TimeoutError:
+                raise ValueError("引用消息读取超时, 请重新引用") from None
+            if quoted:
+                if flags.get("raw"):
+                    raise ValueError("引用图片需要视觉翻译, 不能同时使用 --raw")
+                if not self.translator.enabled:
+                    raise ValueError("引用图片需要启用支持图片的翻译模型, 未提交生图")
+                data = await resolve_image(event, flags.get("image"), candidates=quoted)
+                return {
+                    **flags,
+                    "vision_reference_id": self.store.save_reference(self._key(event), data),
+                }
         if not flags.get("img2img"):
             try:
                 async with asyncio.timeout(30):
@@ -380,14 +401,27 @@ class NaiSeriesPlugin(Star):
     ):
         self._check_access(event)
         flags = flags or {}
-        if not snapshot and (not prompt.strip() or len(prompt) > 12000):
+        if not snapshot and (
+            (not prompt.strip() and not flags.get("vision_reference_id")) or len(prompt) > 12000
+        ):
             raise ValueError("请提供 1-12000 字符的画面描述")
         preset = None if snapshot else self._preset(event, model, flags.get("preset"))
         draft = (
             GenerationRequest(**snapshot)
             if snapshot
-            else self._request(model, prompt, preset, flags)
+            else self._request(model, prompt or "image", preset, flags)
         )
+        route = str(flags.get("route", "")).strip().lower()
+        if route and route not in [provider.name for provider in self.router.providers]:
+            raise ValueError("可用线路: " + ", ".join(p.name for p in self.router.providers))
+        name_getter = getattr(event, "get_sender_name", None)
+        if callable(name_getter):
+            nickname = str(name_getter() or "").strip()
+            if nickname:
+                self.store.put(
+                    "user_name:" + f"{event.get_platform_name()}:{event.get_sender_id()}",
+                    nickname[:200],
+                )
         count = self._count(count)
         batch_id = uuid.uuid4().hex[:12] if count > 1 else ""
         payloads = [
@@ -395,10 +429,12 @@ class NaiSeriesPlugin(Star):
                 "owner": self._key(event),
                 "usage_user": f"{event.get_platform_name()}:{event.get_sender_id()}",
                 "usage_day": datetime.now().astimezone().date().isoformat(),
+                "route": route,
                 "quota_exempt": event.is_admin(),
                 "umo": event.unified_msg_origin,
                 "request": asdict(draft),
                 "original_prompt": prompt,
+                "vision_reference_id": flags.get("vision_reference_id", ""),
                 "artist": preset.artist_prompt if preset else "",
                 "raw": bool(snapshot or flags.get("raw")),
                 "silent": silent,
@@ -522,6 +558,87 @@ class NaiSeriesPlugin(Star):
         )
         if matched is False:
             raise RuntimeError("platform_unavailable")
+
+    async def library(self):
+        """Return dashboard library data without provider credentials."""
+        if not web_request.username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        query = getattr(web_request, "query", {})
+        view = query.get("view", "")
+        try:
+            page = max(0, int(query.get("page", 0)))
+        except (TypeError, ValueError):
+            return error_response("页码无效", status_code=400)
+        today = datetime.now().astimezone().date()
+        rankings = {}
+        with self.store.connect() as db:
+            for key, start in (
+                ("day", today.isoformat()),
+                ("week", (today - timedelta(days=today.weekday())).isoformat()),
+                ("total", "0000-01-01"),
+            ):
+                records = db.execute(
+                    "SELECT user_id, COUNT(*) FROM usage WHERE status='generated' AND day >= ? AND day <= ? GROUP BY user_id ORDER BY COUNT(*) DESC, user_id LIMIT 50",
+                    (start, today.isoformat()),
+                ).fetchall()
+                rankings[key] = [
+                    {
+                        "user": user,
+                        "nickname": self.store.get("user_name:" + user, ""),
+                        "count": count,
+                    }
+                    for user, count in records
+                ]
+        images = []
+        canvas_owner = "dashboard:" + hashlib.sha256(web_request.username.encode()).hexdigest()
+        visible_jobs = []
+        for job in self.store.jobs() if view in ("", "gallery") else []:
+            if job.get("origin") == "canvas" and job.get("owner") != canvas_owner:
+                continue
+            path = self.store.image_path(job["id"])
+            if not path.is_file():
+                continue
+            visible_jobs.append((job, path))
+        for job, path in visible_jobs[page * 30 : (page + 1) * 30]:
+            try:
+                encoded = base64.b64encode(await asyncio.to_thread(path.read_bytes)).decode()
+            except OSError:
+                continue
+            images.append(
+                {
+                    "image": encoded,
+                    "prompt": job.get("original_prompt", ""),
+                    "model": job.get("request", {}).get("model", ""),
+                    "created": job.get("created", 0),
+                }
+            )
+        presets = []
+        for preset in self._load_presets() if view in ("", "presets") else []:
+            path = self.store.preview_path(preset)
+            try:
+                preview = (
+                    base64.b64encode(await asyncio.to_thread(path.read_bytes)).decode()
+                    if path.is_file()
+                    else ""
+                )
+            except OSError:
+                preview = ""
+            presets.append(
+                {
+                    "name": preset.name,
+                    "model": preset.model,
+                    "description": preset.description,
+                    "image": preview,
+                }
+            )
+        return json_response(
+            {
+                "rankings": rankings,
+                "images": images,
+                "presets": presets,
+                "has_more": len(visible_jobs) > (page + 1) * 30,
+            }
+        )
 
     async def canvas_options(self):
         """Return canvas settings without exposing credentials."""
@@ -664,10 +781,20 @@ class NaiSeriesPlugin(Star):
                         )
                     except OSError:
                         raise GenerationError("参考图已失效, 未提交生成") from None
+                vision_image = None
+                if job.get("vision_reference_id"):
+                    try:
+                        vision_image = await asyncio.to_thread(
+                            self.store.reference_path(job["vision_reference_id"]).read_bytes
+                        )
+                    except OSError:
+                        raise GenerationError("引用图片已失效, 未提交生成") from None
                 queue.transition(job, "translating")
                 prompt = job["original_prompt"]
                 try:
-                    if job["raw"]:
+                    if vision_image is not None:
+                        translated = await self.translator.translate(prompt, image=vision_image)
+                    elif job["raw"]:
                         translated = prompt
                     elif job.get("translator"):
                         translated = await self.translator.translate(
@@ -695,9 +822,15 @@ class NaiSeriesPlugin(Star):
                     and self.config.get("show_translated_prompt", False)
                 ):
                     components = [Plain(f"翻译: {translated}")]
-                    if (
-                        self.config.get("send_text_as_image", True)
-                        and len(translated) > TRANSLATION_IMAGE_THRESHOLD
+                    if self.config.get(
+                        "translation_as_image", self.config.get("send_text_as_image", True)
+                    ) and len(translated) > max(
+                        0,
+                        int(
+                            self.config.get(
+                                "translation_image_threshold", TRANSLATION_IMAGE_THRESHOLD
+                            )
+                        ),
                     ):
                         try:
                             image_path = await asyncio.wait_for(
@@ -721,7 +854,10 @@ class NaiSeriesPlugin(Star):
                     if reference
                     else request
                 )
-                images, _route = await self.router.generate(outbound)
+                if job.get("route"):
+                    images, _route = await self.router.generate(outbound, start_route=job["route"])
+                else:
+                    images, _route = await self.router.generate(outbound)
                 if len(images) != 1:
                     raise GenerationError("接口返回图片数量与单张请求不一致")
                 path = self.store.image_path(job["id"])
@@ -804,7 +940,7 @@ class NaiSeriesPlugin(Star):
             model = self._model(flags.pop("model", family))
             if family in ("nai4", "nai5") and model_family(model) != family:
                 raise ValueError(f"请使用 /{model_family(model)} 调用另一模型族")
-            flags = await self._reference_flags(event, model, prompt, flags)
+            flags = await self._reference_flags(event, model, prompt, flags, describe_reply=True)
             self._submit(
                 event,
                 model,
@@ -1059,9 +1195,31 @@ class NaiSeriesPlugin(Star):
         query += " GROUP BY user_id ORDER BY total DESC, user_id LIMIT 10"
         with self.store.connect() as db:
             rows = db.execute(query, args).fetchall()
-        lines = [f"{i}. {user}: {count} 张" for i, (user, count) in enumerate(rows, 1)]
+        entries = []
+        for i, (user, count) in enumerate(rows, 1):
+            platform, _, identifier = user.partition(":")
+            nickname = self.store.get("user_name:" + user, "")
+            avatar = (
+                f"https://q1.qlogo.cn/g?b=qq&nk={identifier}&s=100"
+                if platform in ("aiocqhttp", "qq") and identifier.isdecimal()
+                else ""
+            )
+            entries.append(
+                {
+                    "rank": i,
+                    "user": user,
+                    "id": identifier or user,
+                    "nickname": nickname,
+                    "count": count,
+                    "avatar": avatar,
+                }
+            )
+        lines = [
+            f"{row['rank']}. {row['nickname'] + ' (' + row['id'] + ')' if row['nickname'] else row['user']}: {row['count']} 张"
+            for row in entries
+        ]
         text = f"NAI 生图{label}（成功生成）\n" + ("\n".join(lines) if lines else "暂无记录")
-        if not self.config.get("send_text_as_image", True):
+        if not self.config.get("ranking_as_image", self.config.get("send_text_as_image", True)):
             yield event.plain_result(text)
             return
         try:
@@ -1070,10 +1228,8 @@ class NaiSeriesPlugin(Star):
                     (TEMPLATE_DIR / "ranking.html").read_text(encoding="utf-8"),
                     {
                         "label": label,
-                        "rows": [
-                            {"rank": i, "user": user, "count": count}
-                            for i, (user, count) in enumerate(rows, 1)
-                        ],
+                        "rows": entries,
+                        "maximum": max((row["count"] for row in entries), default=1),
                     },
                     return_url=False,
                     umo=event.unified_msg_origin,
@@ -1169,10 +1325,11 @@ class NaiSeriesPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
             "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
-            "/nai4、/nai5、/nai生图: 有附图或引用图自动图生图, 无图文生图\n"
+            "/nai4、/nai5、/nai生图: 附图自动图生图; 引用图片先生成提示词再文生图\n"
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"
             "/nai排行 日|周|总: 查看生图排行榜，默认总榜\n"
+            "单次指定生图线路: /nai5 描述 --route primary（也可用 secondary 或 third）\n"
             "Nai系列生图\n/nai4 描述 或 /nai5 描述\n批量: /3nai4 描述 或 /3nai5 描述\n选项放描述后: --count 3 --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 

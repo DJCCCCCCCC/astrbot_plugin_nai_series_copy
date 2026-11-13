@@ -264,14 +264,58 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.strength, 0.45)
             self.assertTrue(request.image)
 
-    async def test_command_auto_edit_quoted_image(self):
+    async def test_quoted_image_is_translated_with_user_instruction(self):
+        event = message_event([{"type": "reply", "data": {"id": 123}}])
+        event.bot.call_action.return_value = {"message": [image_segment()]}
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="blue hair, cat")
+        result = [v async for v in self.plugin.cmd_nai5(event, "帮我将角色改成蓝发")]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        request = self.plugin.router.generate.call_args.args[0]
+        self.assertEqual(request.action, "generate")
+        self.assertEqual(request.prompt, "style5, blue hair, cat")
+        self.assertFalse(request.image)
+        args, kwargs = self.plugin.translator.translate.await_args
+        self.assertEqual(args[0], "帮我将角色改成蓝发")
+        self.assertTrue(kwargs["image"])
+        event.bot.call_action.assert_awaited_once_with("get_msg", message_id=123)
+        event.message_obj.message = []
+        event.get_messages = lambda: []
+        [v async for v in self.plugin.cmd_reroll(event)]
+        await self.finish()
+        self.plugin.translator.translate.assert_awaited_once()
+        self.assertEqual(
+            self.plugin.router.generate.await_args.args[0].prompt, "style5, blue hair, cat"
+        )
+
+    async def test_quoted_image_without_text_and_explicit_img2img(self):
+        event = message_event([{"type": "reply", "data": {"id": 123}}])
+        event.bot.call_action.return_value = {"message": [image_segment()]}
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="cat")
+        result = [v async for v in self.plugin.cmd_nai5(event, "")]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        self.assertEqual(self.plugin.translator.translate.await_args.args[0], "")
+        self.assertEqual(self.plugin.router.generate.await_args.args[0].action, "generate")
+        result = [v async for v in self.plugin.cmd_nai5(event, "cat --img2img")]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.await_args.args[0].action, "img2img")
+
+    async def test_quoted_image_translation_errors_do_not_generate(self):
         event = message_event([{"type": "reply", "data": {"id": 123}}])
         event.bot.call_action.return_value = {"message": [image_segment()]}
         result = [v async for v in self.plugin.cmd_nai5(event, "cat")]
-        self.assertIn("已提交", str(result))
+        self.assertIn("需要启用", str(result))
+        self.plugin.translator.enabled = True
+        result = [v async for v in self.plugin.cmd_nai5(event, "cat --raw")]
+        self.assertIn("不能同时使用", str(result))
+        self.plugin.translator.translate = AsyncMock(side_effect=ValueError("vision error"))
+        [v async for v in self.plugin.cmd_nai5(event, "cat")]
         await self.finish()
-        self.assertEqual(self.plugin.router.generate.call_args.args[0].action, "img2img")
-        event.bot.call_action.assert_awaited_once_with("get_msg", message_id=123)
+        self.plugin.router.generate.assert_not_awaited()
 
     async def test_unknown_reference_does_not_fall_back_to_text(self):
         for chain in (

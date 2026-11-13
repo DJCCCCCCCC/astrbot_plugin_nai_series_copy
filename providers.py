@@ -533,12 +533,18 @@ class ProviderRouter:
                         )
                     )
 
-    async def generate(self, request: GenerationRequest) -> tuple[list[GeneratedImage], str]:
+    async def generate(
+        self, request: GenerationRequest, start_route: str = ""
+    ) -> tuple[list[GeneratedImage], str]:
         if not self.providers:
             raise GenerationError("没有配置可用的 NAI 图片连接")
         errors: list[str] = []
-        start = self.next_index % len(self.providers)
-        self.next_index = (start + 1) % len(self.providers)
+        names = [provider.name for provider in self.providers]
+        if start_route and start_route not in names:
+            raise GenerationError("指定的生图线路不可用")
+        start = names.index(start_route) if start_route else self.next_index % len(self.providers)
+        if not start_route:
+            self.next_index = (start + 1) % len(self.providers)
         for offset in range(len(self.providers)):
             provider = self.providers[(start + offset) % len(self.providers)]
             try:

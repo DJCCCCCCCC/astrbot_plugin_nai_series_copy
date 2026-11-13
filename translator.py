@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 
 import aiohttp
@@ -247,16 +248,47 @@ class PromptTranslator:
             raise GenerationError("翻译模型返回错误")
         return content.replace("\n", ", ")
 
-    async def translate(self, text: str, start_model: str = "") -> str:
-        if not self.enabled or not has_chinese(text):
+    async def translate(
+        self, text: str, start_model: str = "", *, image: bytes | None = None
+    ) -> str:
+        if image is not None and not self.enabled:
+            raise ValueError("图片描述需要启用支持视觉的翻译模型; 未发起付费生图")
+        if image is None and (not self.enabled or not has_chinese(text)):
             return text
         if not any(url and key for _, url, key, _ in self.connections):
-            raise ValueError("翻译接口未配置, 请配置翻译模型或使用 --raw")
+            raise ValueError("翻译接口未配置; 未发起付费生图")
+        user_content = text
+        system_prompt = self.system_prompt
+        if image is not None:
+            if image.startswith(b"\x89PNG\r\n\x1a\n"):
+                media_type = "image/png"
+            elif image.startswith(b"\xff\xd8\xff"):
+                media_type = "image/jpeg"
+            elif image.startswith(b"RIFF") and image[8:12] == b"WEBP":
+                media_type = "image/webp"
+            else:
+                raise ValueError("图片格式不受支持; 未发起付费生图")
+            system_prompt += (
+                "\n\nIMAGE DESCRIPTION: Analyze the supplied reference image and describe its "
+                "visible subjects, appearance, clothing, pose, composition, background and style "
+                "as NovelAI prompts following the rules above. Apply the user's requested changes "
+                "to the image description, retain relevant unchanged details, and avoid asserting "
+                "uncertain details. The image is a visual reference for prompt translation only."
+            )
+            user_content = [
+                {"type": "text", "text": text.strip() or "Describe the reference image."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{base64.b64encode(image).decode('ascii')}"
+                    },
+                },
+            ]
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": text},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.1,
             "max_tokens": 1500,
@@ -299,4 +331,5 @@ class PromptTranslator:
                 if reason == "翻译模型返回错误":
                     break
             logger.warning("[NaiSeries] Translation failed for connection %s", name)
-        raise ValueError(f"{reason}; 未发起付费生图, 请检查翻译模型或使用 --raw") from None
+        advice = "请检查翻译模型是否支持图片" if image is not None else "请检查翻译模型或使用 --raw"
+        raise ValueError(f"{reason}; 未发起付费生图, {advice}") from None

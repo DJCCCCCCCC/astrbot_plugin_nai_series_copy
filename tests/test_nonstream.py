@@ -363,6 +363,44 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([req[1]["model"] for req in self.requests], ["first", "second"])
 
     @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_vision_translation_includes_image_and_user_changes(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("POSITIVE: red hair, cat"))
+        translator = PromptTranslator(
+            {
+                "translator_base_url": self.base_url,
+                "translator_api_key": "test",
+                "translator_model": "vision",
+                "translator_system_prompt": "custom NAI rules",
+            }
+        )
+        self.assertEqual(
+            await translator.translate("帮我将角色改成红发", image=PNG), "POSITIVE: red hair, cat"
+        )
+        messages = self.requests[-1][1]["messages"]
+        self.assertIn("custom NAI rules", messages[0]["content"])
+        self.assertIn("Apply the user's requested changes", messages[0]["content"])
+        self.assertEqual(messages[1]["content"][0]["text"], "帮我将角色改成红发")
+        self.assertEqual(messages[1]["content"][1]["image_url"]["url"], URI)
+        await translator.translate("change the character", image=PNG)
+        await translator.translate("", image=PNG)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(
+            self.requests[-1][1]["messages"][1]["content"][0]["text"],
+            "Describe the reference image.",
+        )
+        self.set_json(chat("ERROR: rejected"))
+        with self.assertRaisesRegex(ValueError, "未发起付费生图"):
+            await translator.translate("cat", image=PNG)
+        translator.enabled = False
+        with self.assertRaisesRegex(ValueError, "需要启用"):
+            await translator.translate("cat", image=PNG)
+        translator.enabled = True
+        with self.assertRaisesRegex(ValueError, "图片格式"):
+            await translator.translate("cat", image=b"bad")
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_selected_translator_does_not_change_global_rotation(self):
         from astrbot_plugin_nai_series.translator import PromptTranslator
 
