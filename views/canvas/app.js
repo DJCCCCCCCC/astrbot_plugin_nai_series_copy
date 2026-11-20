@@ -52,6 +52,7 @@ form.addEventListener('submit', async (event) => {
         download.hidden = false;
         document.querySelector('#empty').hidden = true;
         status.textContent = '生成完成';
+        document.dispatchEvent(new Event('canvas-generated'));
         break;
       }
       if (['failed', 'interrupted', 'cancelled', 'send_unknown'].includes(result.state)) throw new Error(result.error);

@@ -2,8 +2,27 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NAI 生图画布</title><link rel="stylesheet" href="./style.css"></head>
 <body>
-  <main>
-    <header><h1>生图画布</h1><p>描述画面，选择模型与尺寸，生成结果会显示在右侧。</p></header>
+  <main class="studio">
+    <nav class="tabs" role="tablist" aria-label="NAI 工作区" aria-orientation="vertical">
+      <button type="button" role="tab" id="tab-canvas" aria-controls="panel-canvas" aria-selected="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/><circle cx="16" cy="8" r="1"/></svg>
+        <span>画布</span>
+      </button>
+      <button type="button" role="tab" id="tab-ranking" aria-controls="panel-ranking" aria-selected="false" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M5 16v-4h4v4m2 0V5h4v11m2 0V9h4v7"/></svg>
+        <span>排行榜</span>
+      </button>
+      <button type="button" role="tab" id="tab-gallery" aria-controls="panel-gallery" aria-selected="false" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg>
+        <span>图库</span>
+      </button>
+      <button type="button" role="tab" id="tab-presets" aria-controls="panel-presets" aria-selected="false" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg>
+        <span>预设库</span>
+      </button>
+    </nav>
+    <section id="panel-canvas" role="tabpanel" aria-labelledby="tab-canvas" tabindex="0">
+    <header><h1>生图画布</h1><p>描述画面，选择模型与尺寸，生成结果会显示在预览区。</p></header>
     <div class="workspace">
       <form id="form">
         <label for="prompt">画面描述</label>
@@ -20,5 +39,29 @@
       </form>
       <section class="preview" aria-label="生成结果"><div id="empty"><strong>生成结果</strong><p>图片将在这里显示</p></div><a id="download" download="nai-image.png" hidden>下载图片</a></section>
     </div>
-  </main><script type="module" src="./app.js"></script>
+    </section>
+    <section id="panel-ranking" role="tabpanel" aria-labelledby="tab-ranking" tabindex="0" hidden>
+      <header><h2>生图排行榜</h2><p>按成功生成的图片数量统计</p></header>
+      <div class="periods" role="group" aria-label="统计周期">
+        <button type="button" data-period="day" aria-pressed="false">今日</button>
+        <button type="button" data-period="week" aria-pressed="false">本周</button>
+        <button type="button" data-period="total" aria-pressed="true">总榜</button>
+      </div>
+      <ol class="ranking-list" data-results></ol>
+      <p class="panel-status" role="status"></p>
+    </section>
+    <section id="panel-gallery" role="tabpanel" aria-labelledby="tab-gallery" tabindex="0" hidden>
+      <header><h2>生图图库</h2><p>查看任务保留期内的生图记录</p></header>
+      <div class="library-grid" data-results></div>
+      <p class="panel-status" role="status"></p>
+      <button type="button" class="load-more" hidden>加载更多</button>
+    </section>
+    <section id="panel-presets" role="tabpanel" aria-labelledby="tab-presets" tabindex="0" hidden>
+      <header><h2>预设库</h2><p>查看预设与已保存的展示图</p></header>
+      <div class="library-grid" data-results></div>
+      <p class="panel-status" role="status"></p>
+    </section>
+  </main>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="./library.js"></script>
 </body></html>

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import hashlib
+import io
 import math
 import re
 import uuid
@@ -19,6 +20,7 @@ from astrbot.api.web import request as web_request
 from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.star.filter.command import GreedyStr
+from PIL import Image as PILImage
 
 from .background import ACTIVE, LABELS, BackgroundQueue
 from .commands import generation_args, resolve_size
@@ -350,6 +352,17 @@ class NaiSeriesPlugin(Star):
                 if not self.translator.enabled:
                     raise ValueError("引用图片需要启用支持图片的翻译模型, 未提交生图")
                 data = await resolve_image(event, flags.get("image"), candidates=quoted)
+                if "size" not in flags:
+                    with PILImage.open(io.BytesIO(data)) as image:
+                        width, height = image.size
+                    size = (
+                        "横图"
+                        if width * 5 > height * 6
+                        else "竖图"
+                        if height * 5 > width * 6
+                        else "方图"
+                    )
+                    flags = {**flags, "size": size}
                 return {
                     **flags,
                     "vision_reference_id": self.store.save_reference(self._key(event), data),

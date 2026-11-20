@@ -304,6 +304,40 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         self.assertEqual(self.plugin.router.generate.await_args.args[0].action, "img2img")
 
+    async def test_quoted_vision_size_tracks_reference_unless_explicit(self):
+        from PIL import Image
+
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="cat")
+        self.plugin.config["size_nai5"] = "大竖图"
+        for dimensions, suffix, expected in (
+            ((121, 100), "", (1216, 832)),
+            ((100, 121), "", (832, 1216)),
+            ((120, 100), "", (1024, 1024)),
+            ((100, 120), "", (1024, 1024)),
+            ((100, 100), "", (1024, 1024)),
+            ((121, 100), " --size 768x1280", (768, 1280)),
+        ):
+            with self.subTest(dimensions=dimensions, suffix=suffix):
+                data = io.BytesIO()
+                Image.new("RGB", dimensions, "blue").save(data, format="PNG")
+                event = message_event([{"type": "reply", "data": {"id": 123}}])
+                event.bot.call_action.return_value = {"message": [image_segment(data.getvalue())]}
+                result = [item async for item in self.plugin.cmd_nai5(event, "cat" + suffix)]
+                self.assertIn("已提交", str(result))
+                await self.finish()
+                request = self.plugin.router.generate.await_args.args[0]
+                self.assertEqual(request.action, "generate")
+                self.assertEqual((request.width, request.height), expected)
+
+        event = message_event([{"type": "reply", "data": {"id": 123}}])
+        event.bot.call_action.return_value = {"message": [image_segment()]}
+        [item async for item in self.plugin.cmd_nai5(event, "cat --img2img")]
+        await self.finish()
+        request = self.plugin.router.generate.await_args.args[0]
+        self.assertEqual(request.action, "img2img")
+        self.assertEqual((request.width, request.height), (1024, 1536))
+
     async def test_quoted_image_translation_errors_do_not_generate(self):
         event = message_event([{"type": "reply", "data": {"id": 123}}])
         event.bot.call_action.return_value = {"message": [image_segment()]}
