@@ -25,6 +25,162 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
     finish = behavior.PluginTests.finish
     execute = behavior.PluginTests.execute
 
+    async def test_dashboard_preset_create_edit_and_defaults(self):
+        class Config(dict):
+            def save_config(self):
+                self.saved = dict(self)
+
+        self.plugin.config = Config(self.plugin.config)
+        event = Event()
+        self.plugin.store.put(self.plugin._key(event), {"presets": {"nai4": "A"}})
+        self.plugin.config["default_preset_nai4"] = "A"
+        existing = self.plugin._load_presets()[0]
+        preview = self.plugin.store.preview_path(existing)
+        preview.write_bytes(png())
+        data = {
+            "id": existing.id,
+            "name": "Renamed",
+            "family": "nai4",
+            "model": "nai4",
+            "artist_prompt": "style",
+            "negative_prompt": None,
+            "description": "desc",
+            "preview_prompt": "cat",
+            "preview_size": "832x1216",
+        }
+        request = SimpleNamespace(
+            username="alice", json=AsyncMock(return_value=data), query={"view": "presets"}
+        )
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            response = await self.plugin.save_library_preset()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(json.loads(response.body)["id"], existing.id)
+            self.assertEqual(self.plugin.config["default_preset_nai4"], existing.id)
+            self.assertEqual(self.plugin._state(event).presets["nai4"], existing.id)
+            edited = self.plugin._load_presets()[0]
+            self.assertIsNone(edited.negative_prompt)
+            self.assertEqual(self.plugin.store.preview_path(edited), preview)
+            library = json.loads((await self.plugin.library()).body)
+            self.assertIsNone(library["presets"][0]["negative_prompt"])
+            self.assertTrue(library["presets"][0]["image"])
+            self.assertEqual(self.plugin.config.saved["presets"][0]["__template_key"], "nai4")
+            request.json.return_value = {**data, "id": "", "name": "New", "negative_prompt": ""}
+            response = await self.plugin.save_library_preset()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.plugin._load_presets()[-1].negative_prompt, "")
+            self.assertNotEqual(json.loads(response.body)["id"], existing.id)
+            request.username = ""
+            self.assertEqual((await self.plugin.save_library_preset()).status_code, 401)
+
+    async def test_dashboard_preset_invalid_does_not_mutate(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config)
+        original = list(self.plugin.config["presets"])
+        base = {
+            "name": "A",
+            "family": "nai4",
+            "model": "nai4",
+            "artist_prompt": "",
+            "negative_prompt": None,
+            "description": "",
+            "preview_prompt": "cat",
+            "preview_size": "832x1216",
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock())
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            for changes in (
+                {},
+                {"name": "X", "model": "nai5"},
+                {"name": "X", "preview_size": "bad"},
+                {"name": "X", "id": "missing"},
+                {"name": "X", "negative_prompt": 1},
+                {"name": "none"},
+            ):
+                request.json.return_value = {**base, **changes}
+                self.assertEqual((await self.plugin.save_library_preset()).status_code, 400)
+            self.assertEqual(self.plugin.config["presets"], original)
+            self.plugin.config.save_config.assert_not_called()
+
+    async def test_dashboard_preset_save_failure_restores_configuration(self):
+        class Config(dict):
+            def save_config(self):
+                raise OSError("write failed")
+
+        self.plugin.config = Config(self.plugin.config)
+        original = list(self.plugin.config["presets"])
+        data = {
+            "name": "New",
+            "family": "nai4",
+            "model": "nai4",
+            "artist_prompt": "",
+            "negative_prompt": None,
+            "description": "",
+            "preview_prompt": "cat",
+            "preview_size": "832x1216",
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            self.assertEqual((await self.plugin.save_library_preset()).status_code, 500)
+        self.assertEqual(self.plugin.config["presets"], original)
+
+    async def test_dashboard_legacy_unnamed_preset_and_save_failures(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config)
+        self.plugin.config["presets"] = [{}, {"model": "nai4", "artist_prompt": "legacy"}]
+        data = {
+            "id": "preset-2",
+            "name": "New",
+            "family": "nai4",
+            "model": "nai4",
+            "artist_prompt": "",
+            "negative_prompt": None,
+            "description": "",
+            "preview_prompt": "cat",
+            "preview_size": "832x1216",
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            with patch.object(self.plugin.store, "connect", side_effect=OSError("db unavailable")):
+                self.assertEqual((await self.plugin.save_library_preset()).status_code, 500)
+            self.plugin.config.save_config.assert_not_called()
+            self.assertEqual(self.plugin.config["presets"][1]["artist_prompt"], "legacy")
+            self.assertEqual((await self.plugin.save_library_preset()).status_code, 200)
+            self.assertEqual(self.plugin.config["presets"][1]["id"], "preset-2")
+            self.assertEqual(self.plugin.config["presets"][1]["name"], "New")
+
+    async def test_dashboard_preset_field_limits(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config)
+        base = {
+            "name": "new",
+            "family": "nai4",
+            "model": "nai4",
+            "artist_prompt": "",
+            "negative_prompt": None,
+            "description": "",
+            "preview_prompt": "cat",
+            "preview_size": "832x1216",
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock())
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            for key, value in (
+                ("name", "x" * 101),
+                ("artist_prompt", "x" * 12001),
+                ("negative_prompt", "x" * 12001),
+                ("preview_prompt", "x" * 12001),
+                ("description", "x" * 1001),
+                ("preview_size", " " * 25 + "832x1216"),
+            ):
+                request.json.return_value = {**base, key: value}
+                self.assertEqual((await self.plugin.save_library_preset()).status_code, 400)
+            self.plugin.config.save_config.assert_not_called()
+
     async def test_canvas_task_uses_queue_and_is_isolated_by_user(self):
         request = SimpleNamespace(
             username="alice",

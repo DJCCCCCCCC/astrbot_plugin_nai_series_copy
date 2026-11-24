@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import math
 import re
 import uuid
@@ -86,6 +87,12 @@ class NaiSeriesPlugin(Star):
         )
         context.register_web_api(
             "/astrbot_plugin_nai_series/library", self.library, ["GET"], "Get library data"
+        )
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/library/presets/save",
+            self.save_library_preset,
+            ["POST"],
+            "Save preset",
         )
         self._tool_names = []
         changed = False
@@ -638,9 +645,15 @@ class NaiSeriesPlugin(Star):
                 preview = ""
             presets.append(
                 {
+                    "id": preset.id,
+                    "family": preset.family,
                     "name": preset.name,
                     "model": preset.model,
+                    "artist_prompt": preset.artist_prompt,
+                    "negative_prompt": preset.negative_prompt,
                     "description": preset.description,
+                    "preview_prompt": preset.preview_prompt,
+                    "preview_size": preset.preview_size,
                     "image": preview,
                 }
             )
@@ -652,6 +665,142 @@ class NaiSeriesPlugin(Star):
                 "has_more": len(visible_jobs) > (page + 1) * 30,
             }
         )
+
+    async def save_library_preset(self):
+        """Create or update a preset from the authenticated dashboard."""
+        if not web_request.username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        try:
+            data = await web_request.json()
+            if not isinstance(data, dict):
+                raise ValueError("请求内容必须是对象")
+            family = data.get("family")
+            if family not in ("nai4", "nai5"):
+                raise ValueError("请选择 NAI 4.5 或 NAI 5")
+            keys = (
+                "name",
+                "model",
+                "artist_prompt",
+                "description",
+                "preview_prompt",
+                "preview_size",
+            )
+            if any(not isinstance(data.get(key), str) for key in keys):
+                raise ValueError("预设字段格式无效")
+            if data.get("negative_prompt") is not None and not isinstance(
+                data["negative_prompt"], str
+            ):
+                raise ValueError("负面提示词格式无效")
+            name = data["name"].strip()
+            model = normalize_model(data["model"].strip())
+            if not name or len(data["name"]) > 100 or name.casefold() in ("none", "无"):
+                raise ValueError("预设名称不能为空、保留名称或超过 100 字符")
+            if not data["model"].strip() or model_family(model) != family:
+                raise ValueError("模型与预设模型族不匹配")
+            if (
+                any(len(data[key]) > 12000 for key in ("artist_prompt", "preview_prompt"))
+                or len(data.get("negative_prompt") or "") > 12000
+                or len(data["description"]) > 1000
+                or len(data["preview_size"]) > 32
+            ):
+                raise ValueError("预设文本过长")
+            width, height = resolve_size(data["preview_size"].strip())
+            GenerationRequest(model, "preview", "", width=width, height=height)
+            requested_id = data.get("id", "")
+            if not isinstance(requested_id, str):
+                raise ValueError("预设 ID 格式无效")
+            raw_presets = self.config.get("presets", [])
+            if not isinstance(raw_presets, list):
+                raise ValueError("当前预设配置不是列表，请先在插件设置中修复")
+            presets = self._load_presets()
+            existing = (
+                next((p for p in presets if p.id == requested_id and p.family == family), None)
+                if requested_id
+                else None
+            )
+            if requested_id and existing is None:
+                raise ValueError("预设不存在或所属模型族已改变")
+            preset_id = existing.id if existing else uuid.uuid4().hex
+            for item in presets:
+                if (
+                    item.family == family
+                    and item is not existing
+                    and (
+                        name.casefold() in (item.name.casefold(), item.id.casefold())
+                        or preset_id.casefold() in (item.name.casefold(), item.id.casefold())
+                    )
+                ):
+                    raise ValueError("预设名称或 ID 与现有预设冲突")
+            entry = {
+                "__template_key": family,
+                "id": preset_id,
+                "name": name,
+                "model": model,
+                "artist_prompt": data["artist_prompt"].strip(),
+                "negative_prompt": data.get("negative_prompt"),
+                "description": data["description"].strip(),
+                "preview_prompt": data["preview_prompt"].strip(),
+                "preview_size": data["preview_size"].strip(),
+            }
+            updated = list(raw_presets)
+            if existing:
+                index = next(
+                    index
+                    for (index, _), item in zip(
+                        ((i, raw) for i, raw in enumerate(raw_presets) if parse_presets([raw])),
+                        presets,
+                    )
+                    if item is existing
+                )
+                if isinstance(updated[index], dict):
+                    entry = {**updated[index], **entry}
+                updated[index] = entry
+            else:
+                updated.append(entry)
+            save = getattr(self.config, "save_config", None)
+            if not callable(save):
+                raise ValueError("当前配置不支持保存预设")
+            if existing and existing.name != name:
+                with self.store.connect() as db:
+                    for key, value in db.execute(
+                        "SELECT key, value FROM state WHERE key LIKE 'session:%'"
+                    ).fetchall():
+                        state = json.loads(value)
+                        selection = state.get("presets", {}) if isinstance(state, dict) else {}
+                        if (
+                            isinstance(selection, dict)
+                            and str(selection.get(family, "")).casefold()
+                            == existing.name.casefold()
+                        ):
+                            selection[family] = preset_id
+                            db.execute(
+                                "UPDATE state SET value=? WHERE key=?",
+                                (json.dumps(state, ensure_ascii=False), key),
+                            )
+            old_values = {
+                key: self.config.get(key)
+                for key in ("presets", f"default_preset_{family}", f"llm_preset_{family}")
+            }
+            self.config["presets"] = updated
+            if existing:
+                for key in (f"default_preset_{family}", f"llm_preset_{family}"):
+                    if str(self.config.get(key, "")).casefold() == existing.name.casefold():
+                        self.config[key] = preset_id
+            try:
+                save()
+            except Exception:
+                for key, value in old_values.items():
+                    if value is None:
+                        self.config.pop(key, None)
+                    else:
+                        self.config[key] = value
+                raise
+            return json_response({"id": preset_id})
+        except (ValueError, TypeError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception:
+            logger.exception("[NaiSeries] Failed to save preset")
+            return error_response("保存预设失败，请查看日志", status_code=500)
 
     async def canvas_options(self):
         """Return canvas settings without exposing credentials."""

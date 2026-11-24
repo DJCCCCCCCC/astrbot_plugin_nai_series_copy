@@ -10,16 +10,20 @@ const preset = document.querySelector('#preset');
 const translator = document.querySelector('#translator');
 const raw = document.querySelector('#raw');
 let options;
+const updatePresets = (selection = options.families[model.value].default_preset) => {
+  const presets = options.families[model.value].presets;
+  preset.replaceChildren(new Option('不使用预设', ''));
+  for (const item of presets) preset.add(new Option(item.name, item.id));
+  const selected = presets.find(item => item.id === selection || item.name === selection);
+  preset.value = selected?.id || '';
+};
 try {
   options = await bridge.apiGet('canvas/options');
   if (!options.translator_enabled) translator.options[0].text = '翻译未启用';
   for (const name of options.translators) translator.add(new Option(name, name));
   const updateModel = () => {
     const family = options.families[model.value];
-    preset.replaceChildren(new Option('不使用预设', ''));
-    for (const item of family.presets) preset.add(new Option(item.name, item.id));
-    const selected = family.presets.find(item => item.id === family.default_preset || item.name === family.default_preset);
-    preset.value = selected?.id || '';
+    updatePresets();
     for (const key of ['steps', 'scale', 'cfg_rescale', 'sampler', 'noise_schedule']) document.getElementById(key).value = family[key];
   };
   model.addEventListener('change', updateModel);
@@ -27,6 +31,16 @@ try {
   raw.addEventListener('change', updateTranslator);
   updateTranslator();
   updateModel();
+  document.addEventListener('presets-changed', async () => {
+    try {
+      const refreshed = await bridge.apiGet('canvas/options');
+      const selection = preset.value;
+      options.families = refreshed.families;
+      updatePresets(selection);
+    } catch {
+      console.warn('Could not refresh canvas presets.');
+    }
+  });
 } catch (error) {
   status.textContent = `加载画布设置失败：${error.message || '请刷新页面'}`;
   button.disabled = true;

@@ -6,7 +6,48 @@ const loaded = new Set();
 const loading = new Set();
 const gallery = document.querySelector('#panel-gallery');
 const loadMore = gallery.querySelector('.load-more');
+const previewDialog = document.querySelector('#library-preview');
+const previewImage = document.createElement('img');
+const previewDownload = previewDialog.querySelector('a');
+const presetPanel = document.querySelector('#panel-presets');
+const presetForm = document.querySelector('#preset-editor');
+const presetNew = document.querySelector('#preset-new');
+const presetCancel = document.querySelector('#preset-cancel');
+const presetSave = presetForm.querySelector('button[type="submit"]');
+const presetFields = presetForm.querySelector('fieldset');
+const presetStatus = presetForm.querySelector('.panel-status');
+const presetFeedback = document.querySelector('#preset-feedback');
+const presetModel = presetForm.elements.namedItem('model');
+const inheritNegative = presetForm.elements.namedItem('inherit_negative');
+const presetNegative = presetForm.elements.namedItem('negative_prompt');
+let editedPreset;
+let editorLauncher;
 let galleryPage = 0;
+
+previewDialog.querySelector('button').addEventListener('click', () => previewDialog.close());
+previewDownload.addEventListener('click', downloadImage);
+previewDialog.addEventListener('close', () => {
+  if (previewDialog.open) return;
+  previewImage.remove();
+  previewImage.removeAttribute('src');
+  previewDownload.removeAttribute('href');
+});
+
+function downloadImage(event) {
+  event.preventDefault();
+  const link = event.currentTarget;
+  const [header, base64] = link.getAttribute('href').split(',');
+  const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+  const url = URL.createObjectURL(new Blob([bytes], { type: header.slice(5, -7) }));
+  const file = document.createElement('a');
+  file.href = url;
+  file.download = link.download;
+  file.hidden = true;
+  link.after(file);
+  file.click();
+  file.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function renderRanking(panel, period, rows) {
   panel.querySelectorAll('[data-period]').forEach(button => {
@@ -45,27 +86,62 @@ function appendCards(grid, rows) {
     const card = document.createElement('article');
     const title = document.createElement('strong');
     title.textContent = row.name || row.prompt || '无描述';
-    if (row.image) {
-      const image = document.createElement('img');
-      image.src = `data:image/png;base64,${row.image}`;
-      image.alt = row.name || row.prompt || '生成图片';
-      image.loading = 'lazy';
-      card.append(image);
-    } else {
-      const placeholder = document.createElement('p');
-      placeholder.className = 'card-placeholder';
-      placeholder.textContent = '暂无展示图';
-      card.append(placeholder);
-    }
     const caption = document.createElement('div');
     caption.className = 'card-caption';
     caption.append(title);
+    const actions = document.createElement('div');
+    actions.className = 'library-actions';
     const description = row.description || row.model;
     if (description) {
       const detail = document.createElement('p');
       detail.textContent = description;
       caption.append(detail);
     }
+    if (row.image) {
+      // Gallery images retain the provider's format. Saved preset previews are PNG.
+      let format = 'png';
+      if (row.image.startsWith('/9j/')) format = 'jpeg';
+      if (row.image.startsWith('UklGR')) format = 'webp';
+      const image = document.createElement('img');
+      image.src = `data:image/${format};base64,${row.image}`;
+      image.alt = row.name || row.prompt || '生成图片';
+      image.loading = 'lazy';
+      card.append(image);
+
+      const enlarge = document.createElement('button');
+      enlarge.type = 'button';
+      enlarge.textContent = '放大预览';
+      const download = document.createElement('a');
+      download.textContent = '下载';
+      download.href = image.src;
+      const filename = row.name ? 'nai-preset-preview' : 'nai-image';
+      download.download = `${filename}.${format === 'jpeg' ? 'jpg' : format}`;
+      download.addEventListener('click', downloadImage);
+      enlarge.addEventListener('click', () => {
+        previewImage.src = image.src;
+        previewImage.alt = image.alt;
+        previewDownload.href = download.href;
+        previewDownload.download = download.download;
+        previewDialog.append(previewImage);
+        previewDialog.showModal();
+      });
+      actions.append(enlarge, download);
+    } else {
+      const placeholder = document.createElement('p');
+      placeholder.className = 'card-placeholder';
+      placeholder.textContent = '暂无展示图';
+      card.append(placeholder);
+    }
+    if (row.id && (row.family === 'nai4' || row.family === 'nai5')) {
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.textContent = '编辑';
+      edit.setAttribute('aria-controls', 'preset-editor');
+      edit.setAttribute('aria-expanded', 'false');
+      edit.addEventListener('click', () => openPresetEditor(row, edit));
+      actions.append(edit);
+    }
+    if (actions.childElementCount) caption.append(actions);
     card.append(caption);
     grid.append(card);
   }
@@ -74,7 +150,7 @@ function appendCards(grid, rows) {
 async function loadView(view, panel) {
   if (loaded.has(view) || loading.has(view)) return;
   loading.add(view);
-  const status = panel.querySelector('.panel-status');
+  const status = panel.querySelector('[data-library-status]');
   status.textContent = '正在加载…';
   try {
     await bridge.ready();
@@ -95,6 +171,8 @@ async function loadView(view, panel) {
       if (view === 'gallery') {
         galleryPage = 0;
         loadMore.hidden = !data.has_more;
+      } else {
+        presetNew.disabled = false;
       }
     }
     loaded.add(view);
@@ -108,6 +186,79 @@ async function loadView(view, panel) {
     loading.delete(view);
   }
 }
+
+function openPresetEditor(preset, launcher) {
+  if (!presetForm.hidden) {
+    presetForm.elements.namedItem('name').focus();
+    return;
+  }
+  editedPreset = preset;
+  editorLauncher = launcher;
+  presetForm.reset();
+  presetForm.querySelector('details').open = false;
+  presetModel.querySelector('[data-existing-model]')?.remove();
+  if (preset) {
+    for (const name of ['name', 'artist_prompt', 'negative_prompt', 'description', 'preview_prompt', 'preview_size']) {
+      presetForm.elements.namedItem(name).value = preset[name] ?? '';
+    }
+    if (![...presetModel.options].some(option => option.value === preset.model)) {
+      const existing = new Option(preset.model, preset.model);
+      existing.dataset.existingModel = '';
+      presetModel.add(existing);
+    }
+    presetModel.value = preset.model;
+  }
+  presetModel.disabled = Boolean(preset);
+  inheritNegative.checked = preset?.negative_prompt == null;
+  presetNegative.disabled = inheritNegative.checked;
+  document.querySelector('#preset-editor-title').textContent = preset ? '编辑预设' : '新增预设';
+  presetStatus.textContent = '';
+  presetFeedback.textContent = '';
+  launcher.setAttribute('aria-expanded', 'true');
+  presetForm.hidden = false;
+  presetForm.elements.namedItem('name').focus();
+}
+
+function closePresetEditor() {
+  presetForm.hidden = true;
+  editorLauncher.setAttribute('aria-expanded', 'false');
+  editorLauncher.focus();
+}
+
+presetNew.addEventListener('click', () => openPresetEditor(null, presetNew));
+presetCancel.addEventListener('click', closePresetEditor);
+inheritNegative.addEventListener('change', () => {
+  presetNegative.disabled = inheritNegative.checked;
+});
+presetForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (presetSave.disabled) return;
+  const payload = Object.fromEntries(new FormData(presetForm));
+  delete payload.inherit_negative;
+  payload.model = presetModel.value;
+  payload.family = editedPreset?.family ?? (payload.model.startsWith('nai-diffusion-4-') ? 'nai4' : 'nai5');
+  if (editedPreset) payload.id = editedPreset.id;
+  if (inheritNegative.checked) payload.negative_prompt = null;
+  presetFields.disabled = true;
+  presetSave.disabled = true;
+  presetCancel.disabled = true;
+  presetStatus.textContent = '正在保存…';
+  try {
+    await bridge.apiPost('library/presets/save', payload);
+    closePresetEditor();
+    presetNew.focus();
+    presetFeedback.textContent = '预设已保存';
+    document.dispatchEvent(new Event('presets-changed'));
+    loaded.delete('presets');
+    await loadView('presets', presetPanel);
+  } catch (error) {
+    presetStatus.textContent = error.message || '保存失败，请重试。';
+  } finally {
+    presetFields.disabled = false;
+    presetSave.disabled = false;
+    presetCancel.disabled = false;
+  }
+});
 
 function selectTab(selected) {
   for (const tab of tabs) {

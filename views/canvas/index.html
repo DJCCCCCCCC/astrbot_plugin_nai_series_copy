@@ -48,20 +48,72 @@
         <button type="button" data-period="total" aria-pressed="true">总榜</button>
       </div>
       <ol class="ranking-list" data-results></ol>
-      <p class="panel-status" role="status"></p>
+      <p class="panel-status" data-library-status role="status"></p>
     </section>
     <section id="panel-gallery" role="tabpanel" aria-labelledby="tab-gallery" tabindex="0" hidden>
       <header><h2>生图图库</h2><p>查看任务保留期内的生图记录</p></header>
       <div class="library-grid" data-results></div>
-      <p class="panel-status" role="status"></p>
+      <p class="panel-status" data-library-status role="status"></p>
       <button type="button" class="load-more" hidden>加载更多</button>
     </section>
     <section id="panel-presets" role="tabpanel" aria-labelledby="tab-presets" tabindex="0" hidden>
-      <header><h2>预设库</h2><p>查看预设与已保存的展示图</p></header>
+      <header class="preset-header">
+        <div><h2>预设库</h2><p>管理生图预设与查看展示图</p></div>
+        <div class="library-actions">
+          <button type="button" id="preset-new" aria-controls="preset-editor" aria-expanded="false" disabled>新增预设</button>
+        </div>
+      </header>
+      <form id="preset-editor" aria-labelledby="preset-editor-title" hidden>
+        <h3 id="preset-editor-title">新增预设</h3>
+        <fieldset>
+        <div class="fields">
+          <div><label for="preset-name">名称</label><input id="preset-name" name="name" required maxlength="100"></div>
+          <div>
+            <label for="preset-model">模型</label>
+            <select id="preset-model" name="model">
+              <option value="nai-diffusion-5-full">NAI 5</option>
+              <option value="nai-diffusion-5-curated">NAI 5 Curated</option>
+              <option value="nai-diffusion-4-5-full">NAI 4.5</option>
+              <option value="nai-diffusion-4-5-curated">NAI 4.5 Curated</option>
+            </select>
+          </div>
+        </div>
+        <label for="preset-artist">画师串</label>
+        <textarea id="preset-artist" name="artist_prompt" maxlength="12000" rows="3"></textarea>
+        <label for="preset-negative">负面提示词</label>
+        <textarea id="preset-negative" name="negative_prompt" maxlength="12000" rows="3"></textarea>
+        <label class="check"><input type="checkbox" name="inherit_negative" checked> 使用模型默认负面词</label>
+        <label for="preset-description">说明</label>
+        <input id="preset-description" name="description" maxlength="1000">
+        <details>
+          <summary>试画设置</summary>
+          <label for="preset-preview-prompt">试画提示词</label>
+          <textarea id="preset-preview-prompt" name="preview_prompt" maxlength="12000" rows="3"></textarea>
+          <label for="preset-preview-size">试画尺寸</label>
+          <input id="preset-preview-size" name="preview_size" value="832x1216" maxlength="32" required>
+        </details>
+        </fieldset>
+        <p class="note">保存后，画布和聊天都可以使用这个预设。</p>
+        <div class="library-actions">
+          <button type="submit">保存预设</button>
+          <button type="button" id="preset-cancel">取消</button>
+        </div>
+        <p class="panel-status" role="status"></p>
+      </form>
+      <p id="preset-feedback" class="panel-status" role="status"></p>
       <div class="library-grid" data-results></div>
-      <p class="panel-status" role="status"></p>
+      <p class="panel-status" data-library-status role="status"></p>
     </section>
   </main>
+  <dialog id="library-preview" aria-labelledby="library-preview-title">
+    <div class="library-preview-toolbar">
+      <h2 id="library-preview-title">图片预览</h2>
+      <div class="library-actions">
+        <a download>下载</a>
+        <button type="button" autofocus>关闭</button>
+      </div>
+    </div>
+  </dialog>
   <script type="module" src="./app.js"></script>
   <script type="module" src="./library.js"></script>
 </body></html>
