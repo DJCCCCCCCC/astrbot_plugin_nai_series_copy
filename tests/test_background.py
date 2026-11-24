@@ -567,6 +567,35 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             ("nai-diffusion-5-full", "style5, translated cat", "bad5"),
         )
 
+    async def test_translation_sections_are_split_in_sent_request_and_reroll(self):
+        event = Event()
+        self.plugin.translator.translate = AsyncMock(
+            return_value="POSITIVE:\r\ncat, garden\r\n\r\nUNDESIRED:\r\nblurry, watermark"
+            "\r\nOPTIONAL CHARACTER PROMPTS:\r\nCHAR1: blue eyes\r\nCHAR2: green scarf"
+        )
+        await self.execute(event, "nai5", "两只猫在花园")
+        generated = self.plugin.router.generate.await_args.args[0]
+        self.assertEqual(generated.prompt, "style5, cat, garden, blue eyes, green scarf")
+        self.assertEqual(generated.negative_prompt, "bad5, blurry, watermark")
+        [item async for item in self.plugin.cmd_reroll(event)]
+        await self.finish()
+        self.plugin.translator.translate.assert_awaited_once()
+        self.assertEqual(self.plugin.router.generate.await_args.args[0], generated)
+
+    async def test_inline_negative_section_and_missing_positive(self):
+        event = Event()
+        self.plugin.translator.translate = AsyncMock(return_value="positive: cat undesired: blur")
+        await self.execute(event, "nai5", "一只猫")
+        generated = self.plugin.router.generate.await_args.args[0]
+        self.assertEqual(
+            (generated.prompt, generated.negative_prompt), ("style5, cat", "bad5, blur")
+        )
+        self.plugin.router.generate.reset_mock()
+        self.plugin.translator.translate.return_value = "POSITIVE:\nUNDESIRED:\nblur"
+        job = await self.execute(event, "nai5", "两只猫")
+        self.plugin.router.generate.assert_not_awaited()
+        self.assertIn("缺少正向提示词", job["generation_error"])
+
     async def test_global_capacity_counts_waiters_and_cancel_before_start(self):
         self.plugin.config.update(max_user_tasks=10, queue_limit=3)
         gate = asyncio.Event()

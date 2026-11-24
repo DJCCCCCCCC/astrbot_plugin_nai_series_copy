@@ -187,6 +187,54 @@ def has_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
+def split_translated_prompt(text: str) -> tuple[str, str]:
+    """Separate the sections of a translated NAI prompt.
+
+    Args:
+        text: The translated tags, optionally with labeled sections.
+
+    Returns:
+        The positive and negative tag strings.
+
+    Raises:
+        ValueError: A labeled translation contains no positive tags.
+    """
+    sections = re.split(
+        r"(?<![^\s,\\])(?:\*\*)?"
+        r"(POSITIVE|UNDESIRED|NEGATIVE(?:[_ ]PROMPT)?|CHAR[ \t]*\d+"
+        r"|OPTIONAL CHARACTER PROMPTS(?:[ \t]+\([^()\r\n]*\))?)"
+        r"(?:\*\*)?[ \t]*[:：](?:\*\*)?",
+        text.strip().replace(r"\r\n", "\n").replace(r"\n", "\n"),
+        flags=re.IGNORECASE,
+    )
+    if len(sections) == 1:
+        return text, ""
+
+    labels = [label.upper() for label in sections[1::2]]
+    positive = []
+    negative = []
+    characters = []
+    # A custom translator may label only the negative section.
+    if "POSITIVE" not in labels and (preamble := sections[0].strip(" ,\r\n\t\\")):
+        positive.append(preamble)
+    for label, block in zip(labels, sections[2::2], strict=True):
+        tags = ", ".join(
+            fragment for line in block.splitlines() if (fragment := line.strip(" ,\t\\"))
+        )
+        if not tags:
+            continue
+        if label == "POSITIVE":
+            positive.append(tags)
+        elif label == "UNDESIRED" or label.startswith("NEGATIVE"):
+            negative.append(tags)
+        elif label.startswith("CHAR"):
+            # Current image requests have a single positive prompt.
+            characters.append(tags)
+    if not positive:
+        raise ValueError("翻译结果缺少正向提示词, 未发起付费生图")
+    return ", ".join(positive + characters), ", ".join(negative)
+
+
 class PromptTranslator:
     def __init__(self, config: dict):
         self.enabled = bool(config.get("translator_enabled", True))
@@ -242,11 +290,13 @@ class PromptTranslator:
                 text, _ = chat_content_parts(message.get("content"))
                 parts.append(text)
         content = "".join(parts).strip()
+        if content.startswith("```") and content.endswith("```") and "\n" in content:
+            content = content.partition("\n")[2][:-3].strip()
         if not recognized or not content:
             raise GenerationError("翻译接口返回里没有文本")
         if content.casefold().startswith("error"):
             raise GenerationError("翻译模型返回错误")
-        return content.replace("\n", ", ")
+        return content
 
     async def translate(
         self, text: str, start_model: str = "", *, image: bytes | None = None

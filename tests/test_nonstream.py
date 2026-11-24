@@ -455,7 +455,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 config["use_stream"] = stream
             translator = PromptTranslator(config)
             result = await translator.translate("一只猫")
-            self.assertIn("POSITIVE", result)
+            self.assertEqual("POSITIVE: cat\nUNDESIRED: bad", result)
             self.assertEqual(self.requests[-1][1]["stream"], stream is True)
         self.body = sse(
             {"choices": [{"index": 0, "delta": {"content": "POSITIVE: cat"}}]},
@@ -471,7 +471,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         )
         for stream in (False, True):
             translator.use_stream = stream
-            self.assertEqual("POSITIVE: cat, UNDESIRED: bad", await translator.translate("一只猫"))
+            self.assertEqual("POSITIVE: cat\nUNDESIRED: bad", await translator.translate("一只猫"))
 
     @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_translator_errors_are_safe_and_distinct(self):
@@ -504,6 +504,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             ({"error": {"message": "fake-credential"}}, "上游错误"),
             ({"choices": [{"message": {"content": "  ERROR: rejected"}}]}, "翻译模型返回错误"),
             ({"choices": [{"message": {"content": "error: rejected"}}]}, "翻译模型返回错误"),
+            (chat("```text\nERROR: rejected\n```"), "翻译模型返回错误"),
         ]
         for response, message in cases:
             self.set_json(response)

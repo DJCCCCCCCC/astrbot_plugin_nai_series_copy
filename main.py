@@ -38,7 +38,7 @@ from .providers import GenerationError, ProviderRouter
 from .references import collect_images, normalize_image, resolve_image
 from .storage import Store
 from .tools import make_tools
-from .translator import PromptTranslator
+from .translator import PromptTranslator, split_translated_prompt
 
 NAI_TOOLS = tuple(
     f"{family}_{mode}_image" for family in ("nai4", "nai5") for mode in ("generate", "edit")
@@ -815,6 +815,10 @@ class NaiSeriesPlugin(Star):
                         )
                     else:
                         translated = await self.translator.translate(prompt)
+                    if not job["raw"]:
+                        positive, negative = split_translated_prompt(translated)
+                        if translated != prompt and positive == translated:
+                            positive = ", ".join(translated.splitlines())
                 except ValueError as exc:
                     # Translator errors contain a local summary, never an upstream body.
                     raise GenerationError(str(exc)) from None
@@ -824,8 +828,11 @@ class NaiSeriesPlugin(Star):
                     if job["raw"]
                     else replace(
                         draft,
-                        prompt=", ".join(
-                            p for p in (job["artist"].strip(), translated.strip()) if p
+                        prompt=", ".join(p for p in (job["artist"].strip(), positive.strip()) if p),
+                        negative_prompt=(
+                            ", ".join(p for p in (draft.negative_prompt.strip(), negative) if p)
+                            if negative
+                            else draft.negative_prompt
                         ),
                     )
                 )
