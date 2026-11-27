@@ -1,14 +1,23 @@
 import asyncio
 import base64
 import io
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import test_behavior as behavior
 from astrbot_plugin_nai_series.models import GenerationRequest
-from astrbot_plugin_nai_series.providers import OfficialNovelAIProvider, OpenAIImagesProvider
-from astrbot_plugin_nai_series.references import collect_images, resolve_image
+from astrbot_plugin_nai_series.providers import (
+    GeneratedImage,
+    OfficialNovelAIProvider,
+    OpenAIImagesProvider,
+)
+from astrbot_plugin_nai_series.references import (
+    collect_images,
+    inspect_precise_reference,
+    resolve_image,
+)
 from test_behavior import Event, png
 from test_core import CoreTests
 
@@ -29,6 +38,42 @@ def message_event(chain, raw=None):
 
 
 class ReferenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_precise_reference_metadata_is_conservative(self):
+        from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+
+        fields = (
+            "director_reference_descriptions",
+            "director_reference_strengths",
+            "director_reference_information_extracted",
+            "director_reference_secondary_strengths",
+        )
+        null_fields = dict.fromkeys(fields)
+        present = {
+            "director_reference_descriptions": [
+                {"caption": {"base_caption": "costume", "char_captions": []}}
+            ]
+        }
+        for metadata, expected in (
+            (null_fields, "not_applied"),
+            (present, "parameters_present"),
+            ({"director_reference_descriptions": None}, "unknown"),
+            (
+                {"director_reference_descriptions": [{"caption": {"base_caption": "style"}}]},
+                "unknown",
+            ),
+            ("invalid", "unknown"),
+        ):
+            with self.subTest(metadata=metadata):
+                info = PngInfo()
+                info.add_text(
+                    "Comment", metadata if isinstance(metadata, str) else json.dumps(metadata)
+                )
+                output = io.BytesIO()
+                Image.new("RGB", (4, 4)).save(output, format="PNG", pnginfo=info)
+                self.assertEqual(inspect_precise_reference(output.getvalue(), "costume"), expected)
+        self.assertEqual(inspect_precise_reference(png(), "costume"), "unknown")
+
     async def test_stale_component_recovers_current_message(self):
         event = message_event([{"type": "image", "file": "/gone/reference.png"}])
         event.message_obj.message_id = 123
@@ -61,6 +106,40 @@ class ReferenceTests(unittest.IsolatedAsyncioTestCase):
             with Image.open(io.BytesIO(data)) as image:
                 self.assertEqual(image.size, (64, 64))
             event.bot.call_action.assert_not_awaited()
+
+    async def test_precise_reference_buckets_preserve_alpha_without_padding(self):
+        from PIL import Image
+
+        for input_size, expected in (
+            ((80, 120), (832, 1216)),
+            ((100, 100), (1024, 1024)),
+            ((160, 100), (1280, 768)),
+            ((32, 512), (256, 4096)),
+        ):
+            with self.subTest(input_size=input_size):
+                buffer = io.BytesIO()
+                Image.new("RGBA", input_size, (255, 0, 0, 128)).save(buffer, format="PNG")
+                event = message_event([image_segment(buffer.getvalue())])
+                data = await resolve_image(event, precise=True)
+                with Image.open(io.BytesIO(data)) as result:
+                    self.assertEqual(result.size, expected)
+                    self.assertEqual(result.mode, "RGBA")
+                    self.assertEqual(result.getpixel((0, 0)), (255, 0, 0, 128))
+                    self.assertEqual(result.getpixel((expected[0] - 1, 0)), (255, 0, 0, 128))
+
+    async def test_precise_reference_respects_exif_orientation(self):
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        image = Image.new("RGB", (120, 80), "white")
+        exif = image.getexif()
+        exif[274] = 6
+        image.save(buffer, format="JPEG", exif=exif)
+        result = await resolve_image(
+            message_event([image_segment(buffer.getvalue())]), precise=True
+        )
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (832, 1216))
 
     async def test_reply_fetched_by_id(self):
         event = message_event([{"type": "reply", "data": {"id": 456}}])
@@ -337,6 +416,130 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         request = self.plugin.router.generate.await_args.args[0]
         self.assertEqual(request.action, "img2img")
         self.assertEqual((request.width, request.height), (1024, 1536))
+
+    async def test_precise_reference_command_and_reroll(self):
+        event = message_event([{"type": "reply", "data": {"id": 123}}])
+        event.bot.call_action.return_value = {"message": [image_segment()]}
+        self.plugin.router.precise_reference_routes = ["primary"]
+        self.plugin.translator.translate = AsyncMock(return_value="cat in a coat")
+        result = [
+            item
+            async for item in self.plugin.cmd_nai5(
+                event, "穿外套的猫 --ref 服装 --ref-strength 2.5 --size 横图"
+            )
+        ]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        request = self.plugin.router.generate.await_args.args[0]
+        self.assertEqual(request.action, "generate")
+        self.assertEqual(request.size, "1216x832")
+        self.assertEqual(request.precise_reference_type, "costume")
+        self.assertEqual(request.precise_reference_strength, 2.5)
+        self.assertTrue(request.precise_reference_image)
+        self.assertFalse(request.image)
+        self.plugin.translator.translate.assert_awaited_once_with("穿外套的猫")
+        snapshot = self.plugin._state(event).last_request
+        self.assertEqual(snapshot["precise_reference_image"], "")
+        self.plugin.store.prune_jobs(float("inf"), set())
+        self.assertTrue(
+            self.plugin.store.reference_path(snapshot["precise_reference_id"]).is_file()
+        )
+        [item async for item in self.plugin.cmd_reroll(event)]
+        await self.finish()
+        self.assertEqual(self.plugin.router.generate.await_args.args[0], request)
+
+        from PIL import Image
+
+        legacy = io.BytesIO()
+        Image.new("RGB", (1024, 1536), "navy").save(legacy, format="PNG")
+        owner = self.plugin._key(event)
+        state = self.plugin.store.get(owner)
+        state["last_request"]["precise_reference_id"] = self.plugin.store.save_reference(
+            owner, legacy.getvalue()
+        )
+        self.plugin.store.put(owner, state)
+        [item async for item in self.plugin.cmd_reroll(event)]
+        await self.finish()
+        request = self.plugin.router.generate.await_args.args[0]
+        with Image.open(io.BytesIO(base64.b64decode(request.precise_reference_image))) as image:
+            self.assertEqual(image.size, (832, 1216))
+        self.assertEqual(request.size, "1216x832")
+
+    async def test_precise_metadata_message_and_successful_quota(self):
+        from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+
+        fields = (
+            "director_reference_descriptions",
+            "director_reference_strengths",
+            "director_reference_information_extracted",
+            "director_reference_secondary_strengths",
+        )
+        event = message_event([image_segment()])
+        self.plugin.router.precise_reference_routes = ["primary"]
+        cases = (
+            (dict.fromkeys(fields), "not_applied", "精准参考未生效"),
+            (
+                {"director_reference_descriptions": [{"caption": {"base_caption": "costume"}}]},
+                "parameters_present",
+                "包含精准参考参数",
+            ),
+            (None, "unknown", "无法从结果元数据验证"),
+        )
+        for metadata, status, text in cases:
+            with self.subTest(status=status):
+                output = io.BytesIO()
+                info = PngInfo()
+                if metadata is not None:
+                    info.add_text("Comment", json.dumps(metadata))
+                Image.new("RGB", (8, 8)).save(output, format="PNG", pnginfo=info)
+                self.plugin.router.generate.return_value = (
+                    [GeneratedImage(output.getvalue())],
+                    "primary",
+                )
+                self.plugin.context.send_message.reset_mock()
+                result = [item async for item in self.plugin.cmd_nai5(event, "cat --ref costume")]
+                self.assertIn("已提交", str(result))
+                await self.finish()
+                job = self.plugin.store.jobs(owner=self.plugin._key(event), limit=1)[0]
+                self.assertEqual(job["state"], "delivered")
+                self.assertEqual(job["precise_reference_status"], status)
+                chain = self.plugin.context.send_message.await_args.args[1].chain
+                self.assertEqual(len(chain), 2)
+                self.assertIn(text, chain[1].text)
+                with self.plugin.store.connect() as db:
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT status FROM usage WHERE job_id=?", (job["id"],)
+                        ).fetchone()[0],
+                        "generated",
+                    )
+        self.assertEqual(self.plugin.router.generate.await_count, 3)
+
+    async def test_precise_reference_invalid_requests_never_generate(self):
+        self.plugin.router.precise_reference_routes = ["primary"]
+        self.plugin.router.providers = [
+            SimpleNamespace(name="primary"),
+            SimpleNamespace(name="secondary"),
+        ]
+        event = message_event([image_segment()])
+        for handler, text, error in (
+            (self.plugin.cmd_nai4, "cat --ref costume", "仅支持 NAI 5"),
+            (self.plugin.cmd_nai5, "cat --ref unknown", "精准参考类型"),
+            (self.plugin.cmd_nai5, "cat --ref-strength 2", "指定精准参考类型"),
+            (self.plugin.cmd_nai5, "cat --ref costume --img2img", "不能与 --img2img"),
+            (self.plugin.cmd_nai5, "cat --ref costume --ref-strength 6", "0–5"),
+            (self.plugin.cmd_nai5, "cat --ref style --route secondary", "该线路未启用"),
+        ):
+            with self.subTest(text=text):
+                result = [item async for item in handler(event, text)]
+                self.assertIn(error, str(result))
+        result = [
+            item async for item in self.plugin.cmd_nai5(message_event([]), "cat --ref costume")
+        ]
+        self.assertIn("附图", str(result))
+        self.assertEqual(self.plugin.store.jobs(), [])
+        self.plugin.router.generate.assert_not_awaited()
 
     async def test_quoted_image_translation_errors_do_not_generate(self):
         event = message_event([{"type": "reply", "data": {"id": 123}}])

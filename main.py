@@ -36,7 +36,7 @@ from .models import (
     parse_presets,
 )
 from .providers import GenerationError, ProviderRouter
-from .references import collect_images, normalize_image, resolve_image
+from .references import collect_images, inspect_precise_reference, normalize_image, resolve_image
 from .storage import Store
 from .tools import make_tools
 from .translator import PromptTranslator, split_translated_prompt
@@ -340,10 +340,44 @@ class NaiSeriesPlugin(Star):
             reference_id=flags.get("reference_id", ""),
             strength=float(flags.get("strength", 0.6)),
             noise=float(flags.get("noise", 0.1)),
+            precise_reference_type=flags.get("ref", ""),
+            precise_reference_strength=float(flags.get("ref-strength", 1.0)),
+            precise_reference_id=flags.get("precise_reference_id", ""),
         )
 
     async def _reference_flags(self, event, model, prompt, flags, describe_reply=False):
         self._check_access(event)
+        if "ref-strength" in flags and "ref" not in flags:
+            raise ValueError("使用 --ref-strength 时也需要通过 --ref 指定精准参考类型")
+        if "ref" in flags:
+            if any(key in flags for key in ("img2img", "strength", "noise")):
+                raise ValueError("精准参考不能与 --img2img、--strength 或 --noise 同时使用")
+            reference_type = flags["ref"].strip().lower()
+            reference_type = {
+                "服装": "costume",
+                "角色": "character",
+                "画风": "style",
+                "角色和画风": "character&style",
+            }.get(reference_type, reference_type)
+            flags = {**flags, "ref": reference_type}
+            self._request(
+                model,
+                prompt,
+                self._preset(event, model, flags.get("preset")),
+                {**flags, "precise_reference_id": "0" * 64},
+            )
+            try:
+                async with asyncio.timeout(30):
+                    candidates = await collect_images(event, strict=True, fetch_current=False)
+                data = await resolve_image(
+                    event, flags.get("image"), candidates=candidates, precise=True
+                )
+            except TimeoutError:
+                raise ValueError("精准参考图读取超时, 请重新附图或引用") from None
+            return {
+                **flags,
+                "precise_reference_id": self.store.save_reference(self._key(event), data),
+            }
         candidates = None
         if describe_reply and not any(flags.get(key) for key in ("img2img", "strength", "noise")):
             try:
@@ -434,6 +468,12 @@ class NaiSeriesPlugin(Star):
         route = str(flags.get("route", "")).strip().lower()
         if route and route not in [provider.name for provider in self.router.providers]:
             raise ValueError("可用线路: " + ", ".join(p.name for p in self.router.providers))
+        if draft.precise_reference_type:
+            supported = self.router.precise_reference_routes
+            if not supported:
+                raise ValueError("没有启用精准参考的图片线路")
+            if route and route not in supported:
+                raise ValueError("该线路未启用精准参考, 可选线路: " + ", ".join(supported))
         name_getter = getattr(event, "get_sender_name", None)
         if callable(name_getter):
             nickname = str(name_getter() or "").strip()
@@ -936,12 +976,18 @@ class NaiSeriesPlugin(Star):
         try:
             if job["state"] != "generated":
                 reference = None
-                if job["request"].get("action") == "img2img":
+                precise_reference_id = job["request"].get("precise_reference_id")
+                reference_id = job["request"].get("reference_id") or precise_reference_id
+                if reference_id:
                     try:
                         reference = await asyncio.to_thread(
-                            self.store.reference_path(job["request"]["reference_id"]).read_bytes
+                            self.store.reference_path(reference_id).read_bytes
                         )
-                    except OSError:
+                        if precise_reference_id:
+                            reference = await asyncio.to_thread(
+                                normalize_image, reference, precise=True
+                            )
+                    except (OSError, ValueError, GenerationError):
                         raise GenerationError("参考图已失效, 未提交生成") from None
                 vision_image = None
                 if job.get("vision_reference_id"):
@@ -1016,13 +1062,29 @@ class NaiSeriesPlugin(Star):
                             logger.warning(
                                 "[NaiSeries] translation render failed: %s", type(exc).__name__
                             )
-                    await self._send(job["umo"], components)
+                    try:
+                        await self._send(job["umo"], components)
+                    except Exception as exc:
+                        result = getattr(exc, "result", None)
+                        retcode = result.get("retcode") if isinstance(result, dict) else None
+                        logger.warning(
+                            "[NaiSeries] task=%s translation preview delivery failed error=%s retcode=%s",
+                            job["id"],
+                            type(exc).__name__,
+                            retcode if type(retcode) is int else None,
+                        )
+                        raise GenerationError(
+                            "翻译已完成，但译文预览发送失败，未提交生图"
+                        ) from None
                 queue.transition(job, "running", request=asdict(request))
-                outbound = (
-                    replace(request, image=base64.b64encode(reference).decode())
-                    if reference
-                    else request
-                )
+                outbound = request
+                if reference is not None:
+                    image_field = (
+                        "precise_reference_image" if request.precise_reference_type else "image"
+                    )
+                    outbound = replace(
+                        request, **{image_field: base64.b64encode(reference).decode()}
+                    )
                 if job.get("route"):
                     images, _route = await self.router.generate(outbound, start_route=job["route"])
                 else:
@@ -1037,7 +1099,13 @@ class NaiSeriesPlugin(Star):
                 state = self.store.get(job["owner"], {})
                 state["last_request"] = asdict(request)
                 self.store.put(job["owner"], state)
-                queue.transition(job, "generated")
+                if request.precise_reference_type:
+                    precise_status = await asyncio.to_thread(
+                        inspect_precise_reference, images[0].data, request.precise_reference_type
+                    )
+                    queue.transition(job, "generated", precise_reference_status=precise_status)
+                else:
+                    queue.transition(job, "generated")
                 if job["preview"]:
                     await asyncio.to_thread(
                         save_preview,
@@ -1049,7 +1117,16 @@ class NaiSeriesPlugin(Star):
                 return
             image = await asyncio.to_thread(self.store.image_path(job["id"]).read_bytes)
             queue.transition(job, "sending")
-            await self._send(job["umo"], [Image.fromBytes(image)])
+            components = [Image.fromBytes(image)]
+            if job["request"].get("precise_reference_type"):
+                status = job.get("precise_reference_status", "unknown")
+                message = {
+                    "not_applied": "精准参考未生效：结果元数据显示参考参数为空。图片已生成，未自动重试。",
+                    "parameters_present": "结果元数据包含精准参考参数，实际相似度取决于模型。",
+                    "unknown": "无法从结果元数据验证精准参考是否生效。图片已生成，未自动重试。",
+                }.get(status, "无法从结果元数据验证精准参考是否生效。图片已生成，未自动重试。")
+                components.append(Plain(message))
+            await self._send(job["umo"], components)
             queue.transition(job, "delivered")
             logger.info(
                 "[NaiSeries] delivered task=%s model=%s", job["id"], job["request"]["model"]
@@ -1494,6 +1571,7 @@ class NaiSeriesPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
             "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
+            "NAI 5 精准参考: 附图或引用图片 + /nai5 描述 --ref costume --ref-strength 1\n"
             "/nai4、/nai5、/nai生图: 附图自动图生图; 引用图片先生成提示词再文生图\n"
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"

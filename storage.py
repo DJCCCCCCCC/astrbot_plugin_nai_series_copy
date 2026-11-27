@@ -154,13 +154,22 @@ class Store:
                     "DELETE FROM state WHERE key=?",
                     ("completion:" + (job.get("batch_id") or job["id"]),),
                 )
-        keep = {j.get("request", {}).get("reference_id") for j in self.jobs()}
-        keep.update(j.get("vision_reference_id") for j in self.jobs())
+        keep = set()
+        for job in self.jobs():
+            request = job.get("request", {})
+            keep.update(
+                (
+                    request.get("reference_id"),
+                    request.get("precise_reference_id"),
+                    job.get("vision_reference_id"),
+                )
+            )
         with self.connect() as db:
             for (value,) in db.execute("SELECT value FROM state"):
                 state = json.loads(value)
                 if isinstance(state, dict):
-                    keep.add((state.get("last_request") or {}).get("reference_id"))
+                    request = state.get("last_request") or {}
+                    keep.update((request.get("reference_id"), request.get("precise_reference_id")))
         for path in (self.root / "references").glob("*.png"):
             if path.stem not in keep and path.stat().st_mtime < cutoff:
                 path.unlink()

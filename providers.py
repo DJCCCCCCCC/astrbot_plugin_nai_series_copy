@@ -54,6 +54,25 @@ def response_error(response, body=b""):
 
 
 def image_parameters(request):
+    if request.precise_reference_type:
+        if not request.precise_reference_image:
+            raise GenerationError("精准参考图不可用, 未提交生图")
+        return {
+            "director_reference_descriptions": [
+                {
+                    "caption": {
+                        "base_caption": request.precise_reference_type,
+                        "char_captions": [],
+                    },
+                    "legacy_uc": False,
+                }
+            ],
+            "director_reference_images": [request.precise_reference_image],
+            "director_reference_strength_values": [request.precise_reference_strength],
+            # V5 sends zero secondary strength without a separate fidelity setting.
+            "director_reference_secondary_strength_values": [0.0],
+            "director_reference_information_extracted": [1.0],
+        }
     if request.action != "img2img":
         return {}
     if not request.image:
@@ -236,13 +255,20 @@ def markdown_image_values(text: str) -> list[str]:
 
 class OpenAIImagesProvider:
     def __init__(
-        self, name: str, base_url: str, api_key: str, timeout: int = 300, use_stream: bool = False
+        self,
+        name: str,
+        base_url: str,
+        api_key: str,
+        timeout: int = 300,
+        use_stream: bool = False,
+        supports_precise_reference: bool = False,
     ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.use_stream = use_stream
+        self.supports_precise_reference = supports_precise_reference
 
     async def _parse_image_value(
         self, value: str, timeout: aiohttp.ClientTimeout
@@ -331,8 +357,14 @@ class OpenAIImagesProvider:
         return images
 
     async def generate(self, request: GenerationRequest) -> list[GeneratedImage]:
-        base = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
-        url = f"{base}/v1/images/generations"
+        base = f"{self.base_url.removesuffix('/v1')}/v1"
+        if request.precise_reference_type:
+            if not self.supports_precise_reference:
+                raise GenerationError("该图片线路未启用精准参考")
+            return await OfficialNovelAIProvider(
+                self.name, base, self.api_key, self.timeout
+            ).generate(request)
+        url = f"{base}/images/generations"
         payload = {
             "model": request.model,
             "prompt": request.prompt,
@@ -369,6 +401,8 @@ class OpenAIImagesProvider:
 
 
 class OfficialNovelAIProvider:
+    supports_precise_reference = True
+
     def __init__(self, name: str, base_url: str, api_key: str, timeout: int = 300):
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -393,7 +427,7 @@ class OfficialNovelAIProvider:
                 "qualityToggle": request.quality,
                 "negative_prompt": request.negative_prompt,
                 "seed": secrets.randbelow(2**32),
-                "params_version": 3,
+                "params_version": 4 if request.precise_reference_type else 3,
                 "cfg_rescale": request.cfg_rescale,
                 "v4_prompt": {
                     "caption": {"base_caption": request.prompt, "char_captions": []},
@@ -407,11 +441,15 @@ class OfficialNovelAIProvider:
             },
         }
         payload["parameters"].update(image_parameters(request))
+        if request.precise_reference_type:
+            payload["parameters"]["image_format"] = "png"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
-                async with session.post(url, json=payload, headers=headers) as response:
+                async with session.post(
+                    url, json=payload, headers=headers, allow_redirects=False
+                ) as response:
                     body = await read_limited(response)
                     if response.status not in (200, 201):
                         raise response_error(response, body)
@@ -420,11 +458,15 @@ class OfficialNovelAIProvider:
                         return self._parse_json_image(body)
                     if "event-stream" in content_type or body.startswith(b"data:"):
                         return self._parse_sse_images(body)
+                    mime = content_type.split(";", 1)[0]
+                    if mime in ("image/png", "image/jpeg", "image/webp"):
+                        _validate_image(body)
+                        return [GeneratedImage(body, mime)]
                     try:
                         archive = zipfile.ZipFile(io.BytesIO(body))
                     except zipfile.BadZipFile as exc:
                         raise GenerationError(
-                            f"{self.name} 返回内容不是 JSON, SSE 或图片 ZIP"
+                            f"{self.name} 返回内容不是 JSON, SSE, 图片或 ZIP"
                         ) from exc
                     images: list[GeneratedImage] = []
                     for item in archive.infolist():
@@ -513,6 +555,7 @@ class ProviderRouter:
         timeout = int(config.get("request_timeout", 300))
         self.providers = []
         self.next_index = 0
+        self.next_precise_index = 0
         for name, key in (("primary", "primary"), ("secondary", "secondary"), ("third", "third")):
             url = str(config.get(f"{key}_base_url", "")).strip()
             api_key = str(config.get(f"{key}_api_key", "")).strip()
@@ -529,9 +572,18 @@ class ProviderRouter:
                 else:
                     self.providers.append(
                         OpenAIImagesProvider(
-                            name, url, api_key, timeout, bool(config.get("use_stream", False))
+                            name,
+                            url,
+                            api_key,
+                            timeout,
+                            bool(config.get("use_stream", False)),
+                            bool(config.get(f"{key}_precise_reference", False)),
                         )
                     )
+
+    @property
+    def precise_reference_routes(self) -> list[str]:
+        return [p.name for p in self.providers if getattr(p, "supports_precise_reference", False)]
 
     async def generate(
         self, request: GenerationRequest, start_route: str = ""
@@ -542,11 +594,29 @@ class ProviderRouter:
         names = [provider.name for provider in self.providers]
         if start_route and start_route not in names:
             raise GenerationError("指定的生图线路不可用")
-        start = names.index(start_route) if start_route else self.next_index % len(self.providers)
-        if not start_route:
-            self.next_index = (start + 1) % len(self.providers)
-        for offset in range(len(self.providers)):
-            provider = self.providers[(start + offset) % len(self.providers)]
+        if request.precise_reference_type:
+            providers = [
+                p for p in self.providers if getattr(p, "supports_precise_reference", False)
+            ]
+            if not providers:
+                raise GenerationError("没有启用精准参考的生图线路, 未提交生图")
+            precise_names = [p.name for p in providers]
+            if start_route and start_route not in precise_names:
+                raise GenerationError("指定的生图线路不支持精准参考, 未提交生图")
+            start = (
+                precise_names.index(start_route)
+                if start_route
+                else self.next_precise_index % len(providers)
+            )
+            if not start_route:
+                self.next_precise_index = (start + 1) % len(providers)
+        else:
+            providers = self.providers
+            start = names.index(start_route) if start_route else self.next_index % len(providers)
+            if not start_route:
+                self.next_index = (start + 1) % len(providers)
+        for offset in range(len(providers)):
+            provider = providers[(start + offset) % len(providers)]
             try:
                 return await provider.generate(request), provider.name
             except GenerationError as exc:

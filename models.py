@@ -70,6 +70,10 @@ class GenerationRequest:
     image: str = field(default="", repr=False)
     strength: float = 0.6
     noise: float = 0.1
+    precise_reference_type: str = ""
+    precise_reference_strength: float = 1.0
+    precise_reference_id: str = ""
+    precise_reference_image: str = field(default="", repr=False)
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]{1,120}", self.model):
@@ -94,6 +98,35 @@ class GenerationRequest:
             raise ValueError("图生图需要参考图")
         if self.action == "generate" and (self.reference_id or self.image):
             raise ValueError("文生图不能携带参考图")
+        if self.precise_reference_type:
+            if self.precise_reference_type not in {
+                "costume",
+                "character",
+                "style",
+                "character&style",
+            }:
+                raise ValueError("精准参考类型须为 costume、character、style 或 character&style")
+            if normalize_model(self.model) not in {
+                "nai-diffusion-5-full",
+                "nai-diffusion-5-curated",
+            }:
+                raise ValueError("精准参考仅支持 NAI 5 Full 和 Curated")
+            if self.action != "generate":
+                raise ValueError("精准参考不能和图生图同时使用")
+            if self.precise_reference_id and not re.fullmatch(
+                r"[a-f0-9]{64}", self.precise_reference_id
+            ):
+                raise ValueError("精准参考图编号无效")
+            if not (self.precise_reference_id or self.precise_reference_image):
+                raise ValueError("精准参考需要一张图片")
+            if (
+                isinstance(self.precise_reference_strength, bool)
+                or not isinstance(self.precise_reference_strength, (float, int))
+                or not 0 <= self.precise_reference_strength <= 5
+            ):
+                raise ValueError("精准参考强度必须在 0–5 之间")
+        elif self.precise_reference_id or self.precise_reference_image:
+            raise ValueError("请选择精准参考类型")
         if any(
             isinstance(v, bool)
             or not isinstance(v, (float, int))

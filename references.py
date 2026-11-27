@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import io
+import json
+import math
 import re
 from pathlib import Path
 
@@ -13,6 +15,103 @@ from PIL import ImageOps
 from .providers import GenerationError, _validate_image, download_image
 
 LIMIT = 24 * 1024 * 1024
+# V5 reference sizes from the published NovelAI web client. Landscape sizes mirror these.
+NAI5_PORTRAIT_REFERENCE_SIZES = (
+    (256, 4096),
+    (256, 4032),
+    (256, 3968),
+    (256, 3904),
+    (256, 3840),
+    (256, 3776),
+    (256, 3712),
+    (256, 3648),
+    (256, 3584),
+    (256, 3520),
+    (256, 3456),
+    (256, 3392),
+    (256, 3328),
+    (320, 3264),
+    (320, 3200),
+    (320, 3136),
+    (320, 3072),
+    (320, 3008),
+    (320, 2944),
+    (320, 2880),
+    (320, 2816),
+    (320, 2752),
+    (384, 2688),
+    (384, 2624),
+    (384, 2560),
+    (384, 2496),
+    (384, 2432),
+    (384, 2368),
+    (448, 2304),
+    (448, 2240),
+    (448, 2176),
+    (448, 2112),
+    (512, 2048),
+    (512, 1984),
+    (512, 1920),
+    (512, 1856),
+    (576, 1792),
+    (576, 1728),
+    (576, 1664),
+    (640, 1600),
+    (640, 1536),
+    (704, 1472),
+    (704, 1408),
+    (768, 1344),
+    (768, 1280),
+    (832, 1216),
+    (896, 1152),
+    (960, 1088),
+)
+NAI5_REFERENCE_SIZES = (
+    *NAI5_PORTRAIT_REFERENCE_SIZES,
+    (1024, 1024),
+    *((height, width) for width, height in reversed(NAI5_PORTRAIT_REFERENCE_SIZES)),
+)
+
+
+def inspect_precise_reference(data, reference_type):
+    """Inspect returned PNG metadata without treating it as proof of visual similarity.
+
+    Args:
+        data: Generated image bytes.
+        reference_type: Requested precise reference type.
+
+    Returns:
+        A metadata status: not_applied, parameters_present, or unknown.
+    """
+    try:
+        with PILImage.open(io.BytesIO(data)) as image:
+            if image.format != "PNG":
+                return "unknown"
+            comment = image.info.get("Comment")
+        if not isinstance(comment, str) or len(comment) > 1024 * 1024:
+            return "unknown"
+        metadata = json.loads(comment)
+        if not isinstance(metadata, dict):
+            return "unknown"
+        fields = (
+            "director_reference_descriptions",
+            "director_reference_strengths",
+            "director_reference_information_extracted",
+            "director_reference_secondary_strengths",
+        )
+        if all(field in metadata and metadata[field] is None for field in fields):
+            return "not_applied"
+        descriptions = metadata.get("director_reference_descriptions")
+        if isinstance(descriptions, list):
+            for item in descriptions:
+                if not isinstance(item, dict):
+                    continue
+                caption = item.get("caption", item)
+                if isinstance(caption, dict) and caption.get("base_caption") == reference_type:
+                    return "parameters_present"
+    except Exception:
+        return "unknown"
+    return "unknown"
 
 
 def _data(value):
@@ -181,11 +280,24 @@ async def _read_reference(event, ref, resolve=True):
     raise ValueError("参考图已失效, 请重新发图或引用原图消息")
 
 
-def normalize_image(data, size=None):
+def normalize_image(data, size=None, *, precise=False):
     _validate_image(data)
     with PILImage.open(io.BytesIO(data)) as source:
-        image = ImageOps.exif_transpose(source).convert("RGB")
-        if size and image.size != size:
+        image = ImageOps.exif_transpose(source)
+        if precise:
+            ratio = math.log(image.width / image.height)
+            width, height = min(
+                NAI5_REFERENCE_SIZES,
+                key=lambda dims: abs(ratio - math.log(dims[0] / dims[1])),
+            )
+            if source.format == "PNG" and source.size == (width, height) and not source.info:
+                return data
+            image = ImageOps.fit(
+                image.convert("RGBA"), (width, height), PILImage.Resampling.LANCZOS
+            )
+        else:
+            image = image.convert("RGB")
+        if not precise and size and image.size != size:
             image = image.resize(size, PILImage.Resampling.LANCZOS)
         output = io.BytesIO()
         image.save(output, format="PNG")
@@ -195,7 +307,7 @@ def normalize_image(data, size=None):
         return value
 
 
-async def resolve_image(event, index=None, *, candidates=None):
+async def resolve_image(event, index=None, *, candidates=None, precise=False):
     async with asyncio.timeout(60):
         if candidates is None:
             candidates = await collect_images(event)
@@ -216,7 +328,7 @@ async def resolve_image(event, index=None, *, candidates=None):
             for ref in candidates[int(selected) - 1]:
                 try:
                     data = await _read_reference(event, ref)
-                    return await asyncio.to_thread(normalize_image, data)
+                    return await asyncio.to_thread(normalize_image, data, precise=precise)
                 except (ValueError, OSError, GenerationError, aiohttp.ClientError, TimeoutError):
                     continue
             message_id = getattr(getattr(event, "message_obj", None), "message_id", None)

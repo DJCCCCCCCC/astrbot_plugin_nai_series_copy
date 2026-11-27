@@ -319,6 +319,28 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.plugin.context.send_message.await_args_list[0].args[1].chain[0], Plain
         )
 
+    async def test_failed_translation_preview_stops_before_generation(self):
+        from aiocqhttp.exceptions import ActionFailed
+        from astrbot.api.message_components import Image, Plain
+
+        self.plugin.config.update(show_translated_prompt=True, translation_image_threshold=4)
+        self.plugin.html_render = AsyncMock(return_value="translation.png")
+        self.plugin.translator.translate = AsyncMock(return_value="cat wearing a blue coat")
+        send = self.plugin.context.send_message
+        send.side_effect = [ActionFailed({"status": "failed", "retcode": 1200}), True]
+        task = await self.execute(Event(), "nai-diffusion-5-full", "猫")
+
+        preview, notice = [call.args[1].chain[0] for call in send.await_args_list]
+        self.assertIsInstance(preview, Image)
+        self.assertIsInstance(notice, Plain)
+        self.assertIn("未提交生图", notice.text)
+        self.assertEqual(task["state"], "failed")
+        self.assertIn("译文预览发送失败", task["generation_error"])
+        self.plugin.router.generate.assert_not_awaited()
+        with self.plugin.store.connect() as db:
+            usage = db.execute("SELECT status FROM usage WHERE job_id=?", (task["id"],)).fetchone()
+            self.assertIsNone(usage)
+
     async def test_library_requires_login_and_isolates_canvas_users(self):
         request = SimpleNamespace(
             username="alice", json=AsyncMock(return_value={"prompt": "猫", "model": "nai4"})
