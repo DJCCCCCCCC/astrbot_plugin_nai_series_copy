@@ -18,6 +18,8 @@ from astrbot_plugin_nai_series.models import (
     model_family,
     normalize_model,
     parse_presets,
+    reference_strength_max,
+    reference_types,
 )
 from astrbot_plugin_nai_series.providers import (
     GenerationError,
@@ -32,6 +34,137 @@ PNG = _buffer.getvalue()
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_reference_capabilities_and_validation(self):
+        for model in ("nai4", "nai-diffusion-4-5-curated"):
+            self.assertEqual(reference_strength_max(model), 1.0)
+            self.assertEqual(set(reference_types(model)), {"character", "style", "character&style"})
+            GenerationRequest(
+                model,
+                "cat",
+                "",
+                precise_reference_type="style",
+                precise_reference_strength=1.0,
+                precise_reference_image="image",
+                request_mode="native",
+            )
+            with self.assertRaisesRegex(ValueError, "0–1"):
+                GenerationRequest(
+                    model,
+                    "cat",
+                    "",
+                    precise_reference_type="style",
+                    precise_reference_strength=1.1,
+                    precise_reference_image="image",
+                )
+            with self.assertRaisesRegex(ValueError, "仅支持 NAI 5"):
+                GenerationRequest(
+                    model,
+                    "cat",
+                    "",
+                    precise_reference_type="costume",
+                    precise_reference_image="image",
+                )
+        for model in ("nai5", "nai-diffusion-5-curated"):
+            self.assertEqual(reference_strength_max(model), 5.0)
+            self.assertIn("costume", reference_types(model))
+        self.assertEqual(reference_types("custom"), ())
+        with self.assertRaisesRegex(ValueError, "原生"):
+            GenerationRequest(
+                "nai5",
+                "cat",
+                "",
+                precise_reference_type="style",
+                precise_reference_image="image",
+                request_mode="openai",
+            )
+        with self.assertRaisesRegex(ValueError, "协议"):
+            GenerationRequest("nai5", "cat", "", request_mode="bad")
+
+    async def test_native_mode_controls_all_generation_types(self):
+        router = ProviderRouter(
+            {
+                "primary_base_url": f"http://127.0.0.1:{self.port}/relay/v1",
+                "primary_api_key": "mock-key",
+                "primary_precise_reference": True,
+                "use_stream": True,
+            }
+        )
+        cases = (
+            (
+                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="native"),
+                "/relay/v1/ai/generate-image",
+                4,
+            ),
+            (
+                GenerationRequest("nai-diffusion-4-5-full", "cat", "", request_mode="native"),
+                "/relay/v1/ai/generate-image",
+                3,
+            ),
+            (
+                GenerationRequest(
+                    "nai-diffusion-5-full",
+                    "cat",
+                    "",
+                    action="img2img",
+                    image=base64.b64encode(PNG).decode(),
+                    request_mode="native",
+                ),
+                "/relay/v1/ai/generate-image",
+                4,
+            ),
+            (
+                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="openai"),
+                "/relay/v1/images/generations",
+                None,
+            ),
+            (
+                GenerationRequest("nai-diffusion-5-full", "cat", ""),
+                "/relay/v1/images/generations",
+                None,
+            ),
+            (
+                GenerationRequest(
+                    "nai-diffusion-4-5-full",
+                    "cat",
+                    "",
+                    precise_reference_type="style",
+                    precise_reference_image=base64.b64encode(PNG).decode(),
+                    request_mode="native",
+                ),
+                "/relay/v1/ai/generate-image",
+                3,
+            ),
+        )
+        for request, path, version in cases:
+            with self.subTest(path=path, version=version, action=request.action):
+                await router.generate(request)
+                actual_path, payload = self.requests[-1]
+                self.assertEqual(actual_path, path)
+                if version:
+                    self.assertEqual(payload["parameters"]["params_version"], version)
+                    self.assertNotIn("stream", payload)
+                else:
+                    self.assertTrue(payload["stream"])
+
+    def test_precise_reference_model_geometry(self):
+        from astrbot_plugin_nai_series.references import normalize_image
+
+        for size, expected in (
+            ((160, 100), (1536, 1024)),
+            ((100, 100), (1472, 1472)),
+            ((100, 160), (1024, 1536)),
+        ):
+            source = io.BytesIO()
+            Image.new("RGBA", size, (255, 0, 0, 128)).save(source, format="PNG")
+            data = normalize_image(source.getvalue(), precise=True, reference_model="nai4")
+            with Image.open(io.BytesIO(data)) as image:
+                self.assertEqual(image.size, expected)
+                self.assertEqual(image.mode, "RGB")
+                self.assertEqual(image.getpixel((expected[0] // 2, expected[1] // 2)), (128, 0, 0))
+        data = normalize_image(PNG, precise=True)
+        with Image.open(io.BytesIO(data)) as image:
+            self.assertEqual(image.size, (1024, 1024))
+
     def test_official_json_and_final_sse(self):
         provider = OfficialNovelAIProvider("native", "https://image.novelai.net", "test")
         encoded = base64.b64encode(PNG).decode()

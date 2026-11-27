@@ -418,6 +418,7 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((request.width, request.height), (1024, 1536))
 
     async def test_precise_reference_command_and_reroll(self):
+        self.plugin.config["request_mode"] = "native"
         event = message_event([{"type": "reply", "data": {"id": 123}}])
         event.bot.call_action.return_value = {"message": [image_segment()]}
         self.plugin.router.precise_reference_routes = ["primary"]
@@ -466,6 +467,7 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.size, "1216x832")
 
     async def test_precise_metadata_message_and_successful_quota(self):
+        self.plugin.config["request_mode"] = "native"
         from PIL import Image
         from PIL.PngImagePlugin import PngInfo
 
@@ -517,6 +519,7 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.router.generate.await_count, 3)
 
     async def test_precise_reference_invalid_requests_never_generate(self):
+        self.plugin.config["request_mode"] = "native"
         self.plugin.router.precise_reference_routes = ["primary"]
         self.plugin.router.providers = [
             SimpleNamespace(name="primary"),
@@ -525,7 +528,11 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         event = message_event([image_segment()])
         for handler, text, error in (
             (self.plugin.cmd_nai4, "cat --ref costume", "仅支持 NAI 5"),
-            (self.plugin.cmd_nai5, "cat --ref unknown", "精准参考类型"),
+            (
+                self.plugin.cmd_nai5,
+                "cat --ref unknown",
+                "精准参考类型有服装、角色、风格、角色＋风格",
+            ),
             (self.plugin.cmd_nai5, "cat --ref-strength 2", "指定精准参考类型"),
             (self.plugin.cmd_nai5, "cat --ref costume --img2img", "不能与 --img2img"),
             (self.plugin.cmd_nai5, "cat --ref costume --ref-strength 6", "0–5"),
@@ -540,6 +547,34 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("附图", str(result))
         self.assertEqual(self.plugin.store.jobs(), [])
         self.plugin.router.generate.assert_not_awaited()
+
+    async def test_chat_precise_reference_respects_mode_and_model(self):
+        self.plugin.router.precise_reference_routes = ["primary"]
+        event = message_event([image_segment()])
+        results = [item async for item in self.plugin.cmd_nai5(event, "cat --ref costume")]
+        self.assertIn("NovelAI 原生模式", str(results))
+        self.plugin.router.generate.assert_not_awaited()
+        self.assertEqual(self.plugin.store.jobs(), [])
+
+        self.plugin.config["request_mode"] = "native"
+        help_text = str([item async for item in self.plugin.cmd_help(event)])
+        self.assertIn("--ref 角色＋风格", help_text)
+        self.assertNotIn("character&style", help_text)
+        for handler, name, reference_type in (
+            (self.plugin.cmd_nai4, "角色", "character"),
+            (self.plugin.cmd_nai4, "风格", "style"),
+            (self.plugin.cmd_nai5, "角色＋风格", "character&style"),
+            (self.plugin.cmd_nai5, "角色 + 风格", "character&style"),
+            (self.plugin.cmd_nai5, "服装", "costume"),
+        ):
+            with self.subTest(reference_type=reference_type):
+                results = [item async for item in handler(event, f"cat --ref {name}")]
+                self.assertIn("已提交", str(results))
+                await self.finish()
+                request = self.plugin.router.generate.await_args.args[0]
+                self.assertEqual(request.request_mode, "native")
+                self.assertEqual(request.precise_reference_type, reference_type)
+                self.assertEqual(request.precise_reference_strength, 1.0)
 
     async def test_quoted_image_translation_errors_do_not_generate(self):
         event = message_event([{"type": "reply", "data": {"id": 123}}])

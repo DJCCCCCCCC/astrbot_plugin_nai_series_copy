@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import aiohttp
 from PIL import Image as PILImage
 
-from .models import GenerationRequest
+from .models import GenerationRequest, normalize_model
 
 
 class GenerationError(RuntimeError):
@@ -361,6 +361,7 @@ class OpenAIImagesProvider:
         if request.precise_reference_type:
             if not self.supports_precise_reference:
                 raise GenerationError("该图片线路未启用精准参考")
+        if request.precise_reference_type or request.request_mode == "native":
             return await OfficialNovelAIProvider(
                 self.name, base, self.api_key, self.timeout
             ).generate(request)
@@ -427,7 +428,10 @@ class OfficialNovelAIProvider:
                 "qualityToggle": request.quality,
                 "negative_prompt": request.negative_prompt,
                 "seed": secrets.randbelow(2**32),
-                "params_version": 4 if request.precise_reference_type else 3,
+                "params_version": 4
+                if normalize_model(request.model).startswith("nai-diffusion-5-")
+                and (request.request_mode == "native" or request.precise_reference_type)
+                else 3,
                 "cfg_rescale": request.cfg_rescale,
                 "v4_prompt": {
                     "caption": {"base_caption": request.prompt, "char_captions": []},

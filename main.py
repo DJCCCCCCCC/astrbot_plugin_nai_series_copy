@@ -34,6 +34,8 @@ from .models import (
     model_family,
     normalize_model,
     parse_presets,
+    reference_strength_max,
+    reference_types,
 )
 from .providers import GenerationError, ProviderRouter
 from .references import collect_images, inspect_precise_reference, normalize_image, resolve_image
@@ -46,6 +48,7 @@ NAI_TOOLS = tuple(
 )
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 TRANSLATION_IMAGE_THRESHOLD = 300
+CANVAS_REFERENCE_LIMIT = 8 * 1024 * 1024
 
 
 class BatchCommandWakeFilter(filter.CustomFilter):
@@ -72,6 +75,12 @@ class NaiSeriesPlugin(Star):
             self.canvas_options,
             ["GET"],
             "Get canvas options",
+        )
+        context.register_web_api(
+            "/astrbot_plugin_nai_series/canvas/request-mode",
+            self.canvas_request_mode,
+            ["POST"],
+            "Set the global image request mode",
         )
         context.register_web_api(
             "/astrbot_plugin_nai_series/canvas/generate",
@@ -301,6 +310,29 @@ class NaiSeriesPlugin(Star):
             )
         return preset.id
 
+    @property
+    def request_mode(self) -> str:
+        """Return the global protocol used for new image jobs."""
+        return "native" if self.config.get("request_mode") == "native" else "openai"
+
+    def _check_precise_route(self, mode: str, route: str = ""):
+        """Check whether an image request can use precise reference.
+
+        Args:
+            mode: The request mode selected at submission.
+            route: An optional starting route selected by the user.
+
+        Raises:
+            ValueError: The mode or route cannot use precise reference.
+        """
+        if mode != "native":
+            raise ValueError("精准参考需要切换到 NovelAI 原生模式")
+        supported = self.router.precise_reference_routes
+        if not supported:
+            raise ValueError("没有启用精准参考的图片线路")
+        if route and route not in supported:
+            raise ValueError("该线路未启用精准参考, 可选线路: " + ", ".join(supported))
+
     def _request(self, model, translated, preset, flags=None):
         flags = flags or {}
         family = model_family(model)
@@ -343,6 +375,7 @@ class NaiSeriesPlugin(Star):
             precise_reference_type=flags.get("ref", ""),
             precise_reference_strength=float(flags.get("ref-strength", 1.0)),
             precise_reference_id=flags.get("precise_reference_id", ""),
+            request_mode=self.request_mode,
         )
 
     async def _reference_flags(self, event, model, prompt, flags, describe_reply=False):
@@ -352,26 +385,25 @@ class NaiSeriesPlugin(Star):
         if "ref" in flags:
             if any(key in flags for key in ("img2img", "strength", "noise")):
                 raise ValueError("精准参考不能与 --img2img、--strength 或 --noise 同时使用")
-            reference_type = flags["ref"].strip().lower()
-            reference_type = {
-                "服装": "costume",
-                "角色": "character",
-                "画风": "style",
-                "角色和画风": "character&style",
-            }.get(reference_type, reference_type)
-            flags = {**flags, "ref": reference_type}
             self._request(
                 model,
                 prompt,
                 self._preset(event, model, flags.get("preset")),
                 {**flags, "precise_reference_id": "0" * 64},
             )
+            self._check_precise_route(
+                self.request_mode, str(flags.get("route", "")).strip().lower()
+            )
             try:
                 async with asyncio.timeout(30):
                     candidates = await collect_images(event, strict=True, fetch_current=False)
-                data = await resolve_image(
-                    event, flags.get("image"), candidates=candidates, precise=True
-                )
+                    data = await resolve_image(
+                        event,
+                        flags.get("image"),
+                        candidates=candidates,
+                        precise=True,
+                        reference_model=model,
+                    )
             except TimeoutError:
                 raise ValueError("精准参考图读取超时, 请重新附图或引用") from None
             return {
@@ -461,7 +493,7 @@ class NaiSeriesPlugin(Star):
             raise ValueError("请提供 1-12000 字符的画面描述")
         preset = None if snapshot else self._preset(event, model, flags.get("preset"))
         draft = (
-            GenerationRequest(**snapshot)
+            GenerationRequest(**{**snapshot, "request_mode": self.request_mode})
             if snapshot
             else self._request(model, prompt or "image", preset, flags)
         )
@@ -469,11 +501,7 @@ class NaiSeriesPlugin(Star):
         if route and route not in [provider.name for provider in self.router.providers]:
             raise ValueError("可用线路: " + ", ".join(p.name for p in self.router.providers))
         if draft.precise_reference_type:
-            supported = self.router.precise_reference_routes
-            if not supported:
-                raise ValueError("没有启用精准参考的图片线路")
-            if route and route not in supported:
-                raise ValueError("该线路未启用精准参考, 可选线路: " + ", ".join(supported))
+            self._check_precise_route(draft.request_mode, route)
         name_getter = getattr(event, "get_sender_name", None)
         if callable(name_getter):
             nickname = str(name_getter() or "").strip()
@@ -849,6 +877,7 @@ class NaiSeriesPlugin(Star):
         presets = self._load_presets()
         families = {}
         for family in ("nai4", "nai5"):
+            model = self._model(family)
             families[family] = {
                 "presets": [{"id": p.id, "name": p.name} for p in presets if p.family == family],
                 "default_preset": str(self.config.get(f"default_preset_{family}", "")),
@@ -857,14 +886,53 @@ class NaiSeriesPlugin(Star):
                 "cfg_rescale": self.config.get(f"cfg_rescale_{family}", 0),
                 "sampler": self.config.get(f"sampler_{family}", "k_euler_ancestral"),
                 "noise_schedule": self.config.get(f"noise_schedule_{family}", "karras"),
+                "reference_types": reference_types(model),
+                "reference_strength_max": reference_strength_max(model),
             }
         return json_response(
             {
                 "families": families,
+                "request_mode": self.request_mode,
+                "precise_reference_available": (
+                    self.request_mode == "native" and bool(self.router.precise_reference_routes)
+                ),
+                "reference_max_bytes": CANVAS_REFERENCE_LIMIT,
                 "translator_enabled": self.translator.enabled,
                 "translators": [
                     name for name, url, key, _ in self.translator.connections if url and key
                 ],
+            }
+        )
+
+    async def canvas_request_mode(self):
+        """Save the global mode for generation requests from the dashboard and chat."""
+        if not web_request.username:
+            return error_response("请先登录 Dashboard", status_code=401)
+        data = await web_request.json(default={})
+        mode = data.get("mode") if isinstance(data, dict) else None
+        if mode not in ("openai", "native"):
+            return error_response("请选择有效的请求模式", status_code=400)
+        if mode != self.request_mode:
+            save = getattr(self.config, "save_config", None)
+            if not callable(save):
+                return error_response("当前配置无法保存请求模式", status_code=500)
+            previous = self.config.get("request_mode")
+            self.config["request_mode"] = mode
+            try:
+                save()
+            except Exception:
+                if previous is None:
+                    self.config.pop("request_mode", None)
+                else:
+                    self.config["request_mode"] = previous
+                logger.exception("[NaiSeries] Failed to save image request mode")
+                return error_response("保存请求模式失败，请查看日志", status_code=500)
+        return json_response(
+            {
+                "request_mode": mode,
+                "precise_reference_available": (
+                    mode == "native" and bool(self.router.precise_reference_routes)
+                ),
             }
         )
 
@@ -876,6 +944,9 @@ class NaiSeriesPlugin(Star):
         data = await web_request.json(default={})
         if not isinstance(data, dict):
             return error_response("请求格式无效", status_code=400)
+        mode = self.request_mode
+        if data.get("request_mode", mode) != mode:
+            return error_response("请求模式已变更，请刷新画布后再提交", status_code=409)
         try:
             prompt = data.get("prompt", "")
             family = data.get("model", "nai4")
@@ -924,8 +995,41 @@ class NaiSeriesPlugin(Star):
                     or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", flags[key])
                 ):
                     raise ValueError("采样器或噪声调度无效")
-            draft = self._request(model, prompt, preset, flags)
             owner = "dashboard:" + hashlib.sha256(username.encode()).hexdigest()
+            reference_type = data.get("reference_type", "")
+            reference_image = data.get("reference_image", "")
+            if not isinstance(reference_type, str) or not isinstance(reference_image, str):
+                raise ValueError("参考图参数无效")
+            if reference_type or reference_image or "reference_strength" in data:
+                self._check_precise_route(mode)
+                if not reference_type or not reference_image:
+                    raise ValueError("请同时选择参考类型并上传参考图")
+                if len(reference_image) > (CANVAS_REFERENCE_LIMIT + 2) // 3 * 4:
+                    raise ValueError("参考图不得超过 8 MB")
+                strength = data.get("reference_strength", 1.0)
+                if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+                    raise ValueError("精准参考强度必须是数字")
+                flags.update(
+                    ref=reference_type,
+                    precise_reference_id="0" * 64,
+                    **{"ref-strength": strength},
+                )
+            draft = self._request(model, prompt, preset, flags)
+            if reference_type:
+                try:
+                    raw_image = base64.b64decode(reference_image, validate=True)
+                except ValueError:
+                    raise ValueError("参考图编码无效") from None
+                if len(raw_image) > CANVAS_REFERENCE_LIMIT:
+                    raise ValueError("参考图不得超过 8 MB")
+                reference = await asyncio.to_thread(
+                    normalize_image, raw_image, precise=True, reference_model=model
+                )
+                if self.request_mode != mode:
+                    return error_response("请求模式已变更，请刷新画布后再提交", status_code=409)
+                draft = replace(
+                    draft, precise_reference_id=self.store.save_reference(owner, reference)
+                )
             task_id = self.queue.submit(
                 {
                     "owner": owner,
@@ -963,6 +1067,8 @@ class NaiSeriesPlugin(Star):
             "state": job["state"],
             "error": job.get("generation_error", "生成失败，请检查插件日志"),
         }
+        if job.get("precise_reference_status"):
+            result["precise_reference_status"] = job["precise_reference_status"]
         if job["state"] in ("generated", "delivered"):
             try:
                 result["image"] = base64.b64encode(
@@ -985,7 +1091,10 @@ class NaiSeriesPlugin(Star):
                         )
                         if precise_reference_id:
                             reference = await asyncio.to_thread(
-                                normalize_image, reference, precise=True
+                                normalize_image,
+                                reference,
+                                precise=True,
+                                reference_model=job["request"]["model"],
                             )
                     except (OSError, ValueError, GenerationError):
                         raise GenerationError("参考图已失效, 未提交生成") from None
@@ -1571,7 +1680,9 @@ class NaiSeriesPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
             "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
-            "NAI 5 精准参考: 附图或引用图片 + /nai5 描述 --ref costume --ref-strength 1\n"
+            "精准参考（需切换到 NovelAI 原生模式）\n"
+            "附图或引用图片后发送 /nai5 描述 --ref 角色＋风格\n"
+            "参考类型有角色、风格、角色＋风格。NAI 5 还支持服装。\n"
             "/nai4、/nai5、/nai生图: 附图自动图生图; 引用图片先生成提示词再文生图\n"
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"

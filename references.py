@@ -12,6 +12,7 @@ import aiohttp
 from PIL import Image as PILImage
 from PIL import ImageOps
 
+from .models import model_family
 from .providers import GenerationError, _validate_image, download_image
 
 LIMIT = 24 * 1024 * 1024
@@ -280,11 +281,25 @@ async def _read_reference(event, ref, resolve=True):
     raise ValueError("参考图已失效, 请重新发图或引用原图消息")
 
 
-def normalize_image(data, size=None, *, precise=False):
+def normalize_image(data, size=None, *, precise=False, reference_model="nai5"):
     _validate_image(data)
     with PILImage.open(io.BytesIO(data)) as source:
         image = ImageOps.exif_transpose(source)
-        if precise:
+        if precise and model_family(reference_model) == "nai4":
+            canvases = ((1024, 1536), (1472, 1472), (1536, 1024))
+            target = min(
+                canvases,
+                key=lambda dims: abs(math.log(image.width * dims[1] / (image.height * dims[0]))),
+            )
+            image = ImageOps.contain(image.convert("RGBA"), target, PILImage.Resampling.LANCZOS)
+            canvas = PILImage.new("RGB", target, "black")
+            canvas.paste(
+                image,
+                ((target[0] - image.width) // 2, (target[1] - image.height) // 2),
+                image.getchannel("A"),
+            )
+            image = canvas
+        elif precise:
             ratio = math.log(image.width / image.height)
             width, height = min(
                 NAI5_REFERENCE_SIZES,
@@ -307,7 +322,9 @@ def normalize_image(data, size=None, *, precise=False):
         return value
 
 
-async def resolve_image(event, index=None, *, candidates=None, precise=False):
+async def resolve_image(
+    event, index=None, *, candidates=None, precise=False, reference_model="nai5"
+):
     async with asyncio.timeout(60):
         if candidates is None:
             candidates = await collect_images(event)
@@ -328,7 +345,9 @@ async def resolve_image(event, index=None, *, candidates=None, precise=False):
             for ref in candidates[int(selected) - 1]:
                 try:
                     data = await _read_reference(event, ref)
-                    return await asyncio.to_thread(normalize_image, data, precise=precise)
+                    return await asyncio.to_thread(
+                        normalize_image, data, precise=precise, reference_model=reference_model
+                    )
                 except (ValueError, OSError, GenerationError, aiohttp.ClientError, TimeoutError):
                     continue
             message_id = getattr(getattr(event, "message_obj", None), "message_id", None)

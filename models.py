@@ -19,6 +19,20 @@ MODEL_ALIASES = {
     "nai4-curated": "nai-diffusion-4-5-curated",
     "nai5-curated": "nai-diffusion-5-curated",
 }
+REFERENCE_TYPE_LABELS = {
+    "costume": "服装",
+    "character": "角色",
+    "style": "风格",
+    "character&style": "角色＋风格",
+}
+REFERENCE_TYPE_ALIASES = {
+    **{label: code for code, label in REFERENCE_TYPE_LABELS.items()},
+    "人物": "character",
+    "画风": "style",
+    "角色和画风": "character&style",
+    "角色和风格": "character&style",
+    "角色＋画风": "character&style",
+}
 
 
 def normalize_model(value: str | None, default: str = "nai-diffusion-4-5-full") -> str:
@@ -34,6 +48,37 @@ def model_family(model: str) -> str:
     if normalized.startswith("nai-diffusion-4-"):
         return "nai4"
     return re.sub(r"[^a-z0-9]+", "_", normalized).strip("_") or "custom"
+
+
+def reference_types(model: str) -> tuple[str, ...]:
+    """Return supported precise-reference types for a model.
+
+    Args:
+        model: Model identifier or alias.
+
+    Returns:
+        Supported reference types, or an empty tuple for an unsupported model.
+    """
+    normalized = normalize_model(model)
+    if normalized in {"nai-diffusion-5-full", "nai-diffusion-5-curated"}:
+        return ("costume", "character", "style", "character&style")
+    if normalized in {"nai-diffusion-4-5-full", "nai-diffusion-4-5-curated"}:
+        return ("character", "style", "character&style")
+    return ()
+
+
+def reference_strength_max(model: str) -> float:
+    """Return the model's maximum precise-reference strength.
+
+    Args:
+        model: Model identifier or alias.
+
+    Returns:
+        Maximum strength, or zero for an unsupported model.
+    """
+    if not reference_types(model):
+        return 0.0
+    return 5.0 if model_family(model) == "nai5" else 1.0
 
 
 @dataclass(frozen=True)
@@ -74,6 +119,7 @@ class GenerationRequest:
     precise_reference_strength: float = 1.0
     precise_reference_id: str = ""
     precise_reference_image: str = field(default="", repr=False)
+    request_mode: str = ""
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]{1,120}", self.model):
@@ -92,25 +138,33 @@ class GenerationRequest:
         object.__setattr__(self, "noise_schedule", self.noise_schedule.strip())
         if self.action not in ("generate", "img2img"):
             raise ValueError("不支持的生成模式")
+        if self.request_mode not in ("", "openai", "native"):
+            raise ValueError("生图接口协议无效")
         if self.reference_id and not re.fullmatch(r"[a-f0-9]{64}", self.reference_id):
             raise ValueError("参考图编号无效")
         if self.action == "img2img" and not (self.reference_id or self.image):
             raise ValueError("图生图需要参考图")
         if self.action == "generate" and (self.reference_id or self.image):
             raise ValueError("文生图不能携带参考图")
+        if not isinstance(self.precise_reference_type, str):
+            raise ValueError("精准参考类型无效")
+        reference_type = re.sub(r"\s*[+＋]\s*", "＋", self.precise_reference_type.strip().lower())
+        object.__setattr__(
+            self,
+            "precise_reference_type",
+            REFERENCE_TYPE_ALIASES.get(reference_type, reference_type),
+        )
         if self.precise_reference_type:
-            if self.precise_reference_type not in {
-                "costume",
-                "character",
-                "style",
-                "character&style",
-            }:
-                raise ValueError("精准参考类型须为 costume、character、style 或 character&style")
-            if normalize_model(self.model) not in {
-                "nai-diffusion-5-full",
-                "nai-diffusion-5-curated",
-            }:
-                raise ValueError("精准参考仅支持 NAI 5 Full 和 Curated")
+            choices = reference_types(self.model)
+            if not choices:
+                raise ValueError("精准参考仅支持 NAI 4.5 或 NAI 5 Full 和 Curated")
+            if self.precise_reference_type not in choices:
+                if self.precise_reference_type == "costume" and model_family(self.model) == "nai4":
+                    raise ValueError("服装精准参考仅支持 NAI 5")
+                labels = "、".join(REFERENCE_TYPE_LABELS[choice] for choice in choices)
+                raise ValueError(f"当前模型支持的精准参考类型有{labels}")
+            if self.request_mode == "openai":
+                raise ValueError("精准参考需要切换到 NovelAI 原生模式")
             if self.action != "generate":
                 raise ValueError("精准参考不能和图生图同时使用")
             if self.precise_reference_id and not re.fullmatch(
@@ -122,9 +176,11 @@ class GenerationRequest:
             if (
                 isinstance(self.precise_reference_strength, bool)
                 or not isinstance(self.precise_reference_strength, (float, int))
-                or not 0 <= self.precise_reference_strength <= 5
+                or not 0 <= self.precise_reference_strength <= reference_strength_max(self.model)
             ):
-                raise ValueError("精准参考强度必须在 0–5 之间")
+                raise ValueError(
+                    f"精准参考强度必须在 0–{reference_strength_max(self.model):g} 之间"
+                )
         elif self.precise_reference_id or self.precise_reference_image:
             raise ValueError("请选择精准参考类型")
         if any(

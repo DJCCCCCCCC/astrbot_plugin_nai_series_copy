@@ -1,7 +1,9 @@
 """Lifecycle, admission, snapshots and real AstrBot silent tool execution."""
 
 import asyncio
+import base64
 import json
+import threading
 import time
 import unittest
 from dataclasses import asdict
@@ -24,6 +26,198 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = behavior.PluginTests.asyncTearDown
     finish = behavior.PluginTests.finish
     execute = behavior.PluginTests.execute
+
+    async def test_canvas_request_mode_requires_auth_and_persists(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config)
+        self.plugin.router.precise_reference_routes = ["primary"]
+        request = SimpleNamespace(username="", json=AsyncMock(return_value={"mode": "native"}))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 401)
+            self.assertEqual((await self.plugin.canvas_options()).status_code, 401)
+            self.plugin.config.save_config.assert_not_called()
+            request.username = "alice"
+            for invalid in (None, {}, {"mode": "invalid"}, {"mode": True}):
+                request.json.return_value = invalid
+                self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 400)
+            request.json.return_value = {"mode": "native"}
+            response = await self.plugin.canvas_request_mode()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(json.loads(response.body)["request_mode"], "native")
+            self.assertTrue(json.loads(response.body)["precise_reference_available"])
+            self.assertEqual(self.plugin.config["request_mode"], "native")
+            self.plugin.config.save_config.assert_called_once()
+            options = json.loads((await self.plugin.canvas_options()).body)
+            self.assertEqual(options["request_mode"], "native")
+            self.assertTrue(options["precise_reference_available"])
+            self.assertEqual(options["reference_max_bytes"], 8 * 1024 * 1024)
+            self.assertIn("character", options["families"]["nai5"]["reference_types"])
+            self.assertEqual(options["families"]["nai5"]["reference_strength_max"], 5)
+            request.json.return_value = {"mode": "openai"}
+            response = await self.plugin.canvas_request_mode()
+            self.assertEqual(json.loads(response.body)["request_mode"], "openai")
+            self.assertFalse(json.loads(response.body)["precise_reference_available"])
+
+    async def test_canvas_request_mode_save_failure_restores_old_config(self):
+        class Config(dict):
+            def save_config(self):
+                raise OSError("save failed")
+
+        self.plugin.config = Config(self.plugin.config)
+        self.plugin.router.precise_reference_routes = ["primary"]
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value={"mode": "native"}))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 500)
+            self.assertNotIn("request_mode", self.plugin.config)
+            self.plugin.config["request_mode"] = "openai"
+            self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 500)
+            self.assertEqual(self.plugin.config["request_mode"], "openai")
+            self.assertEqual(self.plugin.request_mode, "openai")
+
+    async def test_canvas_precise_reference_stores_and_sends_only_safe_image(self):
+        self.plugin.config["request_mode"] = "native"
+        self.plugin.router.precise_reference_routes = ["primary"]
+        data = {
+            "prompt": "cat",
+            "model": "nai5",
+            "request_mode": "native",
+            "reference_type": "服装",
+            "reference_strength": 2.5,
+            "reference_image": base64.b64encode(png()).decode(),
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            response = await self.plugin.canvas_generate()
+            self.assertEqual(response.status_code, 200)
+            task_id = json.loads(response.body)["id"]
+            job = next(job for job in self.plugin.store.jobs() if job["id"] == task_id)
+            self.assertEqual(job["request"]["request_mode"], "native")
+            self.assertEqual(job["request"]["precise_reference_type"], "costume")
+            self.assertEqual(job["request"]["precise_reference_strength"], 2.5)
+            self.assertFalse(job["request"]["precise_reference_image"])
+            ref = job["request"]["precise_reference_id"]
+            self.assertTrue(self.plugin.store.reference_path(ref).is_file())
+            self.assertNotIn(data["reference_image"], json.dumps(job))
+            await self.finish()
+            outgoing = self.plugin.router.generate.await_args.args[0]
+            self.assertEqual(outgoing.request_mode, "native")
+            self.assertEqual(outgoing.precise_reference_type, "costume")
+            self.assertEqual(outgoing.precise_reference_strength, 2.5)
+            self.assertTrue(
+                base64.b64decode(outgoing.precise_reference_image).startswith(b"\x89PNG")
+            )
+            result = json.loads((await self.plugin.canvas_task(task_id)).body)
+            self.assertEqual(result["state"], "delivered")
+
+    async def test_canvas_rejects_invalid_precise_reference_and_stale_mode(self):
+        data = {
+            "prompt": "cat",
+            "model": "nai5",
+            "request_mode": "native",
+            "reference_type": "costume",
+            "reference_strength": 2.5,
+            "reference_image": base64.b64encode(png()).decode(),
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        self.plugin.router.precise_reference_routes = ["primary"]
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 409)
+            self.plugin.config["request_mode"] = "native"
+            self.plugin.router.precise_reference_routes = []
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 400)
+            self.plugin.router.precise_reference_routes = ["primary"]
+            for change in (
+                {"reference_type": "unknown"},
+                {"reference_image": "bad base64!"},
+                {"reference_strength": True},
+                {"reference_strength": 6},
+                {"model": "nai4", "reference_type": "costume"},
+                {"reference_image": ""},
+            ):
+                request.json.return_value = {**data, **change}
+                self.assertEqual((await self.plugin.canvas_generate()).status_code, 400)
+            request.json.return_value = {**data, "request_mode": "openai"}
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 409)
+            self.assertEqual(self.plugin.store.jobs(), [])
+            self.plugin.router.generate.assert_not_awaited()
+
+    async def test_canvas_queued_jobs_keep_request_mode_after_change(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config)
+        self.plugin.queue.config = self.plugin.config
+        self.plugin.router.precise_reference_routes = ["primary"]
+        gate = asyncio.Event()
+
+        async def generate(request):
+            await gate.wait()
+            return [GeneratedImage(png())], "test"
+
+        self.plugin.router.generate.side_effect = generate
+        request = SimpleNamespace(
+            username="alice",
+            json=AsyncMock(
+                return_value={"prompt": "cat", "model": "nai5", "request_mode": "native"}
+            ),
+        )
+        self.plugin.config["request_mode"] = "native"
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            first = await self.plugin.canvas_generate()
+            self.assertEqual(first.status_code, 200)
+            request.json.return_value = {"mode": "openai"}
+            self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 200)
+            request.json.return_value = {"prompt": "dog", "model": "nai5", "request_mode": "openai"}
+            second = await self.plugin.canvas_generate()
+            self.assertEqual(second.status_code, 200)
+            gate.set()
+            await self.finish()
+        sent = {
+            call.args[0].prompt: call.args[0].request_mode
+            for call in self.plugin.router.generate.await_args_list
+        }
+        self.assertEqual(sent, {"cat": "native", "dog": "openai"})
+
+    async def test_canvas_rejects_mode_change_during_reference_preparation(self):
+        class Config(dict):
+            save_config = MagicMock()
+
+        self.plugin.config = Config(self.plugin.config, request_mode="native")
+        self.plugin.queue.config = self.plugin.config
+        self.plugin.router.precise_reference_routes = ["primary"]
+        started = threading.Event()
+        release = threading.Event()
+
+        def normalize(data, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("test timeout")
+            return data
+
+        data = {
+            "prompt": "cat",
+            "model": "nai5",
+            "request_mode": "native",
+            "reference_type": "costume",
+            "reference_image": base64.b64encode(png()).decode(),
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        with (
+            patch("astrbot_plugin_nai_series.main.web_request", request),
+            patch("astrbot_plugin_nai_series.main.normalize_image", side_effect=normalize),
+        ):
+            task = asyncio.create_task(self.plugin.canvas_generate())
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                request.json.return_value = {"mode": "openai"}
+                self.assertEqual((await self.plugin.canvas_request_mode()).status_code, 200)
+            finally:
+                release.set()
+            self.assertEqual((await task).status_code, 409)
+            self.assertEqual(self.plugin.store.jobs(), [])
+            self.plugin.router.generate.assert_not_awaited()
 
     async def test_dashboard_preset_create_edit_and_defaults(self):
         class Config(dict):
