@@ -25,14 +25,10 @@
     <header><h1>生图画布</h1><p>描述画面，选择模型与尺寸，生成结果会显示在预览区。</p></header>
     <div class="workspace">
       <form id="form">
-        <div class="mode-group" role="group" aria-label="全局生图请求模式">
-          <span class="mode-title">生图请求模式</span>
-          <div class="mode-buttons">
-            <button type="button" data-request-mode="openai" aria-pressed="false" disabled>OpenAI Images</button>
-            <button type="button" data-request-mode="native" aria-pressed="false" disabled>NovelAI 原生</button>
-          </div>
-          <p class="mode-note">应用到所有用户的画布和聊天新任务。</p>
-          <p id="mode-status" role="status" aria-live="polite"></p>
+        <div class="site-group">
+          <label for="image-endpoint">生图站</label>
+          <select id="image-endpoint" disabled aria-describedby="site-hint"><option value="">自动轮换</option></select>
+          <p id="site-hint" class="mode-note">指定后，本次生成只使用所选站点。</p>
         </div>
         <label for="prompt">画面描述</label>
         <textarea id="prompt" maxlength="12000" required placeholder="描述你想生成的画面"></textarea>
@@ -50,7 +46,7 @@
         </fieldset>
         <fieldset class="reference-fields">
           <legend>精准参考（可选）</legend>
-          <p id="reference-hint" class="mode-note">使用原生模式选择参考图和参考类型。</p>
+          <p id="reference-hint" class="mode-note">选择支持精准参考的生图站，或使用自动轮换。</p>
           <label for="reference-type">参考类型</label>
           <select id="reference-type" disabled><option value="">不使用参考</option></select>
           <label for="reference-image">参考图片</label>

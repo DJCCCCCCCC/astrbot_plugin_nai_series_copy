@@ -314,7 +314,8 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_router_does_not_retry_parse_or_download_errors(self):
         for error in (GenerationError("返回里没有图片"), GenerationError("URL 下载失败: HTTP 403")):
-            first, second = AsyncMock(), AsyncMock()
+            first = SimpleNamespace(name="first", request_mode="openai", generate=AsyncMock())
+            second = SimpleNamespace(name="second", request_mode="openai", generate=AsyncMock())
             first.generate.side_effect = error
             router = ProviderRouter({})
             router.providers = [first, second]
@@ -323,8 +324,12 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             second.generate.assert_not_awaited()
 
     async def test_router_rotation_and_safe_fallback(self):
-        first = SimpleNamespace(name="primary", generate=AsyncMock(return_value=["a"]))
-        second = SimpleNamespace(name="secondary", generate=AsyncMock(return_value=["b"]))
+        first = SimpleNamespace(
+            name="primary", request_mode="openai", generate=AsyncMock(return_value=["a"])
+        )
+        second = SimpleNamespace(
+            name="secondary", request_mode="openai", generate=AsyncMock(return_value=["b"])
+        )
         router = ProviderRouter({})
         router.providers = [first, second]
         self.assertEqual((await router.generate(REQUEST))[1], "primary")

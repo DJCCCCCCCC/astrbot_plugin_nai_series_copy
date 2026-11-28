@@ -418,7 +418,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((request.width, request.height), (1024, 1536))
 
     async def test_precise_reference_command_and_reroll(self):
-        self.plugin.config["request_mode"] = "native"
         event = message_event([{"type": "reply", "data": {"id": 123}}])
         event.bot.call_action.return_value = {"message": [image_segment()]}
         self.plugin.router.precise_reference_routes = ["primary"]
@@ -474,7 +473,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             output = io.BytesIO()
             Image.new("RGB", (64, 64), color).save(output, format="PNG")
             buffers.append(output.getvalue())
-        self.plugin.config["request_mode"] = "native"
         self.plugin.router.precise_reference_routes = ["primary"]
         self.plugin.translator.enabled = True
         self.plugin.translator.translate = AsyncMock(
@@ -509,7 +507,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_explicit_reference_options_work_independently(self):
-        self.plugin.config["request_mode"] = "native"
         self.plugin.router.precise_reference_routes = ["primary"]
         self.plugin.translator.enabled = True
         self.plugin.translator.translate = AsyncMock(return_value="POSITIVE: cat")
@@ -529,7 +526,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("image", self.plugin.translator.translate.await_args.kwargs)
 
     async def test_explicit_reference_rejects_conflicts_and_bad_indices(self):
-        self.plugin.config["request_mode"] = "native"
         self.plugin.router.precise_reference_routes = ["primary"]
         self.plugin.translator.enabled = True
         self.plugin.translator.translate = AsyncMock(return_value="cat")
@@ -564,7 +560,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.store.jobs(), [])
 
     async def test_precise_metadata_message_and_successful_quota(self):
-        self.plugin.config["request_mode"] = "native"
         from PIL import Image
         from PIL.PngImagePlugin import PngInfo
 
@@ -667,7 +662,6 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("分别描述", records[0]["generation_error"])
 
     async def test_precise_reference_invalid_requests_never_generate(self):
-        self.plugin.config["request_mode"] = "native"
         self.plugin.router.precise_reference_routes = ["primary"]
         self.plugin.router.providers = [
             SimpleNamespace(name="primary"),
@@ -684,7 +678,8 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             (self.plugin.cmd_nai5, "cat --ref-strength 2", "指定精准参考类型"),
             (self.plugin.cmd_nai5, "cat --ref costume --img2img", "不能与 --img2img"),
             (self.plugin.cmd_nai5, "cat --ref costume --ref-strength 6", "0–5"),
-            (self.plugin.cmd_nai5, "cat --ref style --route secondary", "该线路未启用"),
+            (self.plugin.cmd_nai5, "cat --ref style --route secondary", "精准参考"),
+            (self.plugin.cmd_nai5, "cat --ref style --生站 secondary", "精准参考"),
         ):
             with self.subTest(text=text):
                 result = [item async for item in handler(event, text)]
@@ -696,15 +691,15 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.store.jobs(), [])
         self.plugin.router.generate.assert_not_awaited()
 
-    async def test_chat_precise_reference_respects_mode_and_model(self):
-        self.plugin.router.precise_reference_routes = ["primary"]
+    async def test_chat_precise_reference_respects_site_capability_and_model(self):
+        self.plugin.router.precise_reference_routes = []
         event = message_event([image_segment()])
         results = [item async for item in self.plugin.cmd_nai5(event, "cat --ref costume")]
-        self.assertIn("NovelAI 原生模式", str(results))
+        self.assertIn("精准参考", str(results))
         self.plugin.router.generate.assert_not_awaited()
         self.assertEqual(self.plugin.store.jobs(), [])
 
-        self.plugin.config["request_mode"] = "native"
+        self.plugin.router.precise_reference_routes = ["primary"]
         help_text = str([item async for item in self.plugin.cmd_help(event)])
         self.assertIn("--ref 角色＋风格", help_text)
         self.assertNotIn("character&style", help_text)
@@ -720,7 +715,7 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("已提交", str(results))
                 await self.finish()
                 request = self.plugin.router.generate.await_args.args[0]
-                self.assertEqual(request.request_mode, "native")
+                self.assertEqual(request.request_mode, "")
                 self.assertEqual(request.precise_reference_type, reference_type)
                 self.assertEqual(request.precise_reference_strength, 1.0)
 

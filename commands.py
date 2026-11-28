@@ -7,7 +7,7 @@ def generation_args(text):
     flags = {}
     pattern = (
         r"(?:^|\s)--(raw|img2img|preset|model|size|steps|scale|count|"
-        r"strength|noise|image|route|ref|ref-strength|参考|角色|服装)(?=\s|$)"
+        r"strength|noise|image|route|ref|ref-strength|参考|角色|服装|生站)(?=\s|$)"
     )
     matches = list(re.finditer(pattern, text))
     if not matches:
@@ -28,6 +28,11 @@ def generation_args(text):
             if not value:
                 raise ValueError(f"--{key} 缺少值")
             flags[key] = value.strip('"')
+    if "生站" in flags:
+        if not flags["生站"].strip():
+            raise ValueError("--生站 缺少生图站 ID")
+        if "route" in flags:
+            raise ValueError("--生站 和 --route 只能选一个")
     return prompt, flags
 
 

@@ -83,12 +83,6 @@ class NaiSeriesPlugin(Star):
             "Get canvas options",
         )
         context.register_web_api(
-            "/astrbot_plugin_nai_series/canvas/request-mode",
-            self.canvas_request_mode,
-            ["POST"],
-            "Set the global image request mode",
-        )
-        context.register_web_api(
             "/astrbot_plugin_nai_series/canvas/generate",
             self.canvas_generate,
             ["POST"],
@@ -111,6 +105,20 @@ class NaiSeriesPlugin(Star):
         )
         self._tool_names = []
         changed = False
+        if self.router.migrated_endpoints:
+            config["image_endpoints"] = self.router.migrated_endpoints
+            changed = True
+        if config.get("image_endpoints"):
+            for name in ("primary", "secondary", "third"):
+                for field, empty in (
+                    ("base_url", ""),
+                    ("api_key", ""),
+                    ("precise_reference", False),
+                ):
+                    key = f"{name}_{field}"
+                    if config.get(key):
+                        config[key] = empty
+                        changed = True
         for preset in config.get("presets", []):
             if isinstance(preset, dict) and not preset.get("id"):
                 preset["id"] = uuid.uuid4().hex
@@ -316,28 +324,26 @@ class NaiSeriesPlugin(Star):
             )
         return preset.id
 
-    @property
-    def request_mode(self) -> str:
-        """Return the global protocol used for new image jobs."""
-        return "native" if self.config.get("request_mode") == "native" else "openai"
-
-    def _check_precise_route(self, mode: str, route: str = ""):
-        """Check whether an image request can use precise reference.
+    def _check_image_route(self, route: str, *, precise: bool = False):
+        """Validate a selected image site and its precise reference capability.
 
         Args:
-            mode: The request mode selected at submission.
-            route: An optional starting route selected by the user.
+            route: An optional site ID selected by the user.
+            precise: Whether the request uses precise reference.
 
         Raises:
-            ValueError: The mode or route cannot use precise reference.
+            ValueError: The selected site is unavailable or lacks the required capability.
         """
-        if mode != "native":
-            raise ValueError("精准参考需要切换到 NovelAI 原生模式")
-        supported = self.router.precise_reference_routes
-        if not supported:
-            raise ValueError("没有启用精准参考的图片线路")
-        if route and route not in supported:
-            raise ValueError("该线路未启用精准参考, 可选线路: " + ", ".join(supported))
+        if route:
+            names = [provider.name for provider in self.router.providers]
+            if route not in names:
+                raise ValueError("生图站 ID 未配置，可用线路: " + (", ".join(names) or "无"))
+        if precise:
+            supported = self.router.precise_reference_routes
+            if route and route not in supported:
+                raise ValueError(f"生图站 {route} 未启用精准参考")
+            if not supported:
+                raise ValueError("没有启用精准参考的 NovelAI 原生生图站")
 
     def _request(self, model, translated, preset, flags=None):
         flags = flags or {}
@@ -381,7 +387,6 @@ class NaiSeriesPlugin(Star):
             precise_reference_type=flags.get("ref", ""),
             precise_reference_strength=float(flags.get("ref-strength", 1.0)),
             precise_reference_id=flags.get("precise_reference_id", ""),
-            request_mode=self.request_mode,
         )
 
     async def _reference_flags(self, event, model, prompt, flags, describe_reply=False):
@@ -399,8 +404,8 @@ class NaiSeriesPlugin(Star):
                 self._preset(event, model, flags.get("preset")),
                 {**flags, "precise_reference_id": "0" * 64},
             )
-            self._check_precise_route(
-                self.request_mode, str(flags.get("route", "")).strip().lower()
+            self._check_image_route(
+                str(flags.get("生站", flags.get("route", ""))).strip().lower(), precise=True
             )
             try:
                 async with asyncio.timeout(30):
@@ -507,8 +512,8 @@ class NaiSeriesPlugin(Star):
             validation,
         )
         if precise:
-            self._check_precise_route(
-                self.request_mode, str(result.get("route", "")).strip().lower()
+            self._check_image_route(
+                str(result.get("生站", result.get("route", ""))).strip().lower(), precise=True
             )
         try:
             async with asyncio.timeout(30):
@@ -570,15 +575,13 @@ class NaiSeriesPlugin(Star):
             raise ValueError("请提供 1-12000 字符的画面描述")
         preset = None if snapshot else self._preset(event, model, flags.get("preset"))
         draft = (
-            GenerationRequest(**{**snapshot, "request_mode": self.request_mode})
+            GenerationRequest(**{**snapshot, "request_mode": ""})
             if snapshot
             else self._request(model, prompt or "image", preset, flags)
         )
         route = str(flags.get("route", "")).strip().lower()
-        if route and route not in [provider.name for provider in self.router.providers]:
-            raise ValueError("可用线路: " + ", ".join(p.name for p in self.router.providers))
-        if draft.precise_reference_type:
-            self._check_precise_route(draft.request_mode, route)
+        site_id = str(flags.get("生站", "")).strip().lower()
+        self._check_image_route(site_id or route, precise=bool(draft.precise_reference_type))
         name_getter = getattr(event, "get_sender_name", None)
         if callable(name_getter):
             nickname = str(name_getter() or "").strip()
@@ -595,6 +598,7 @@ class NaiSeriesPlugin(Star):
                 "usage_user": f"{event.get_platform_name()}:{event.get_sender_id()}",
                 "usage_day": datetime.now().astimezone().date().isoformat(),
                 "route": route,
+                "image_endpoint": site_id,
                 "quota_exempt": event.is_admin(),
                 "umo": event.unified_msg_origin,
                 "request": asdict(draft),
@@ -970,47 +974,19 @@ class NaiSeriesPlugin(Star):
         return json_response(
             {
                 "families": families,
-                "request_mode": self.request_mode,
-                "precise_reference_available": (
-                    self.request_mode == "native" and bool(self.router.precise_reference_routes)
-                ),
+                "image_endpoints": [
+                    {
+                        "id": provider.name,
+                        "request_mode": provider.request_mode,
+                        "supports_precise_reference": provider.supports_precise_reference,
+                    }
+                    for provider in self.router.providers
+                ],
                 "reference_max_bytes": CANVAS_REFERENCE_LIMIT,
                 "translator_enabled": self.translator.enabled,
                 "translators": [
                     name for name, url, key, _ in self.translator.connections if url and key
                 ],
-            }
-        )
-
-    async def canvas_request_mode(self):
-        """Save the global mode for generation requests from the dashboard and chat."""
-        if not web_request.username:
-            return error_response("请先登录 Dashboard", status_code=401)
-        data = await web_request.json(default={})
-        mode = data.get("mode") if isinstance(data, dict) else None
-        if mode not in ("openai", "native"):
-            return error_response("请选择有效的请求模式", status_code=400)
-        if mode != self.request_mode:
-            save = getattr(self.config, "save_config", None)
-            if not callable(save):
-                return error_response("当前配置无法保存请求模式", status_code=500)
-            previous = self.config.get("request_mode")
-            self.config["request_mode"] = mode
-            try:
-                save()
-            except Exception:
-                if previous is None:
-                    self.config.pop("request_mode", None)
-                else:
-                    self.config["request_mode"] = previous
-                logger.exception("[NaiSeries] Failed to save image request mode")
-                return error_response("保存请求模式失败，请查看日志", status_code=500)
-        return json_response(
-            {
-                "request_mode": mode,
-                "precise_reference_available": (
-                    mode == "native" and bool(self.router.precise_reference_routes)
-                ),
             }
         )
 
@@ -1022,10 +998,11 @@ class NaiSeriesPlugin(Star):
         data = await web_request.json(default={})
         if not isinstance(data, dict):
             return error_response("请求格式无效", status_code=400)
-        mode = self.request_mode
-        if data.get("request_mode", mode) != mode:
-            return error_response("请求模式已变更，请刷新画布后再提交", status_code=409)
         try:
+            site_id = data.get("image_endpoint", "")
+            if not isinstance(site_id, str):
+                raise ValueError("生图站 ID 无效")
+            site_id = site_id.strip().lower()
             prompt = data.get("prompt", "")
             family = data.get("model", "nai4")
             if (
@@ -1085,8 +1062,9 @@ class NaiSeriesPlugin(Star):
                 raise ValueError("参考图参数无效")
             if vision_reference_image and (raw or not self.translator.enabled):
                 raise ValueError("普通参考图需要启用支持图片的翻译模型并使用翻译")
-            if reference_type or reference_image or "reference_strength" in data:
-                self._check_precise_route(mode)
+            precise = bool(reference_type or reference_image or "reference_strength" in data)
+            self._check_image_route(site_id, precise=precise)
+            if precise:
                 if not reference_type or not reference_image:
                     raise ValueError("请同时选择参考类型并上传参考图")
                 strength = data.get("reference_strength", 1.0)
@@ -1132,8 +1110,6 @@ class NaiSeriesPlugin(Star):
                 for reference in prepared:
                     if isinstance(reference, BaseException):
                         raise reference
-                if self.request_mode != mode:
-                    return error_response("请求模式已变更，请刷新画布后再提交", status_code=409)
                 reference_ids = {
                     key: self.store.save_reference(owner, reference)
                     for key, reference in zip(selected, prepared, strict=True)
@@ -1150,6 +1126,7 @@ class NaiSeriesPlugin(Star):
                     "usage_day": datetime.now().astimezone().date().isoformat(),
                     "quota_exempt": True,
                     "umo": "",
+                    "image_endpoint": site_id,
                     "request": asdict(draft),
                     "original_prompt": prompt,
                     "vision_reference_id": vision_reference_id,
@@ -1333,7 +1310,11 @@ class NaiSeriesPlugin(Star):
                     outbound = replace(
                         request, **{image_field: base64.b64encode(reference).decode()}
                     )
-                if job.get("route"):
+                if job.get("image_endpoint"):
+                    images, _route = await self.router.generate(
+                        outbound, site_id=job["image_endpoint"]
+                    )
+                elif job.get("route"):
                     images, _route = await self.router.generate(outbound, start_route=job["route"])
                 else:
                     images, _route = await self.router.generate(outbound)
@@ -1832,7 +1813,7 @@ class NaiSeriesPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent):
         yield event.plain_result(
             "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
-            "精准参考（需切换到 NovelAI 原生模式）\n"
+            "精准参考（需配置支持精准参考的 NovelAI 原生生图站）\n"
             "附图或引用图片后发送 /nai5 描述 --ref 角色＋风格\n"
             "双图参考可发 /nai5 描述 --参考 1 --角色 2，也可用 --服装 2。图片按附图在前、引用图在后的顺序编号。\n"
             "参考类型有角色、风格、角色＋风格。NAI 5 还支持服装。\n"
@@ -1841,7 +1822,7 @@ class NaiSeriesPlugin(Star):
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"
             "/nai排行 日|周|总: 查看生图排行榜，默认总榜\n"
-            "单次指定生图线路: /nai5 描述 --route primary（也可用 secondary 或 third）\n"
+            "单次锁定生图站: /nai5 描述 --生站 站点ID。失败时不会切站，省略则轮换。\n"
             "Nai系列生图\n/nai4 描述 或 /nai5 描述\n批量: /3nai4 描述 或 /3nai5 描述\n选项放描述后: --count 3 --preset 名称 --raw --size 832x1216 --steps 23 --scale 5 --model 完整模型名\n/预设 nai4|nai5 名称 (none 关闭预设)\n/nai预设 [nai4|nai5] [页码]: 查看图册, 不产生生图费用\n/nai预设展示 [nai4|nai5] 名称 + 附图/引用图: 设置展示图(管理员)\n/nai预设试画 [nai4|nai5] 名称: 生成并保存样图(付费, 管理员)\n/nai模型 完整名 + /nai生图 描述\n/nai状态 /nai重绘 /nai任务\n/nai取消 [任务编号]: 取消自己当前会话的任务\n/nai取图 任务编号: 重新发送已保存图片, 不重新生图\n设置按当前用户和会话分别保存, 两模型预设互不影响."
         )
 

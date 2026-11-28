@@ -10,7 +10,7 @@ import json
 import re
 import secrets
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -254,6 +254,9 @@ def markdown_image_values(text: str) -> list[str]:
 
 
 class OpenAIImagesProvider:
+    request_mode = "openai"
+    supports_precise_reference = False
+
     def __init__(
         self,
         name: str,
@@ -261,14 +264,12 @@ class OpenAIImagesProvider:
         api_key: str,
         timeout: int = 300,
         use_stream: bool = False,
-        supports_precise_reference: bool = False,
     ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.use_stream = use_stream
-        self.supports_precise_reference = supports_precise_reference
 
     async def _parse_image_value(
         self, value: str, timeout: aiohttp.ClientTimeout
@@ -359,12 +360,7 @@ class OpenAIImagesProvider:
     async def generate(self, request: GenerationRequest) -> list[GeneratedImage]:
         base = f"{self.base_url.removesuffix('/v1')}/v1"
         if request.precise_reference_type:
-            if not self.supports_precise_reference:
-                raise GenerationError("该图片线路未启用精准参考")
-        if request.precise_reference_type or request.request_mode == "native":
-            return await OfficialNovelAIProvider(
-                self.name, base, self.api_key, self.timeout
-            ).generate(request)
+            raise GenerationError("该图片线路未启用精准参考")
         url = f"{base}/images/generations"
         prompt = request.prompt
         if request.character_prompts:
@@ -408,13 +404,22 @@ class OpenAIImagesProvider:
 
 
 class OfficialNovelAIProvider:
-    supports_precise_reference = True
+    request_mode = "native"
 
-    def __init__(self, name: str, base_url: str, api_key: str, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        api_key: str,
+        timeout: int = 300,
+        *,
+        supports_precise_reference: bool = True,
+    ):
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.supports_precise_reference = supports_precise_reference
 
     async def generate(self, request: GenerationRequest) -> list[GeneratedImage]:
         url = f"{self.base_url}/ai/generate-image"
@@ -575,79 +580,124 @@ class OfficialNovelAIProvider:
 
 
 class ProviderRouter:
-    """Try configured endpoints in order; provider choice never enters user commands."""
+    """Route requests through the configured sites, with optional single-site selection."""
 
     def __init__(self, config: dict[str, Any]):
         timeout = int(config.get("request_timeout", 300))
-        self.providers = []
+        self.providers: list[OpenAIImagesProvider | OfficialNovelAIProvider] = []
         self.next_index = 0
         self.next_precise_index = 0
-        for name, key in (("primary", "primary"), ("secondary", "secondary"), ("third", "third")):
-            url = str(config.get(f"{key}_base_url", "")).strip()
-            api_key = str(config.get(f"{key}_api_key", "")).strip()
-            if url and api_key:
-                parsed = urlparse(url)
-                if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
-                    raise ValueError("图片连接地址必须是有效 HTTP(S) URL")
-                if parsed.hostname == "novelai.net" or parsed.hostname.endswith(".novelai.net"):
-                    self.providers.append(
-                        OfficialNovelAIProvider(
-                            name, f"{parsed.scheme}://{parsed.netloc}", api_key, timeout
-                        )
+        entries = config.get("image_endpoints", [])
+        self.migrated_endpoints: list[dict[str, Any]] = []
+        if not entries:
+            for name in ("primary", "secondary", "third"):
+                url = config.get(f"{name}_base_url")
+                api_key = config.get(f"{name}_api_key")
+                if (
+                    isinstance(url, str)
+                    and url.strip()
+                    and isinstance(api_key, str)
+                    and api_key.strip()
+                ):
+                    self.migrated_endpoints.append(
+                        {
+                            "__template_key": "image_endpoint",
+                            "id": name,
+                            "base_url": url.strip(),
+                            "api_key": api_key.strip(),
+                            "request_mode": config.get("request_mode", "openai"),
+                            "supports_precise_reference": bool(
+                                config.get(f"{name}_precise_reference", False)
+                            ),
+                        }
                     )
-                else:
-                    self.providers.append(
-                        OpenAIImagesProvider(
-                            name,
-                            url,
-                            api_key,
-                            timeout,
-                            bool(config.get("use_stream", False)),
-                            bool(config.get(f"{key}_precise_reference", False)),
-                        )
+            entries = self.migrated_endpoints
+
+        names: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name, url, api_key = (
+                str(entry.get(key) or "").strip() for key in ("id", "base_url", "api_key")
+            )
+            if not (name and url and api_key):
+                continue
+            name = name.lower()
+            if name in names:
+                raise ValueError(f"生图站 ID 重复: {name}")
+            names.add(name)
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
+                raise ValueError(f"生图站 {name} 的地址必须是有效 HTTP(S) URL")
+            official = parsed.hostname == "novelai.net" or parsed.hostname.endswith(".novelai.net")
+            mode = entry.get("request_mode", "openai")
+            if official and entries is self.migrated_endpoints:
+                entry["request_mode"] = mode = "native"
+            if mode == "native":
+                base = (
+                    f"{parsed.scheme}://{parsed.netloc}"
+                    if official
+                    else f"{url.rstrip('/').removesuffix('/v1')}/v1"
+                )
+                self.providers.append(
+                    OfficialNovelAIProvider(
+                        name,
+                        base,
+                        api_key,
+                        timeout,
+                        supports_precise_reference=official
+                        or bool(entry.get("supports_precise_reference", False)),
                     )
+                )
+            elif mode == "openai":
+                self.providers.append(
+                    OpenAIImagesProvider(
+                        name, url, api_key, timeout, bool(config.get("use_stream"))
+                    )
+                )
+            else:
+                raise ValueError(f"生图站 {name} 的请求模式无效")
 
     @property
     def precise_reference_routes(self) -> list[str]:
-        return [p.name for p in self.providers if getattr(p, "supports_precise_reference", False)]
+        return [p.name for p in self.providers if p.supports_precise_reference]
 
     async def generate(
-        self, request: GenerationRequest, start_route: str = ""
+        self, request: GenerationRequest, start_route: str = "", *, site_id: str = ""
     ) -> tuple[list[GeneratedImage], str]:
         if not self.providers:
             raise GenerationError("没有配置可用的 NAI 图片连接")
         errors: list[str] = []
-        names = [provider.name for provider in self.providers]
-        if start_route and start_route not in names:
+        selected = site_id or start_route
+        if selected and not any(p.name == selected for p in self.providers):
             raise GenerationError("指定的生图线路不可用")
-        if request.precise_reference_type:
-            providers = [
-                p for p in self.providers if getattr(p, "supports_precise_reference", False)
-            ]
-            if not providers:
-                raise GenerationError("没有启用精准参考的生图线路, 未提交生图")
-            precise_names = [p.name for p in providers]
-            if start_route and start_route not in precise_names:
+        precise = bool(request.precise_reference_type)
+        providers = (
+            [p for p in self.providers if p.supports_precise_reference]
+            if precise
+            else self.providers
+        )
+        if selected:
+            names = [p.name for p in providers]
+            if selected not in names:
                 raise GenerationError("指定的生图线路不支持精准参考, 未提交生图")
-            start = (
-                precise_names.index(start_route)
-                if start_route
-                else self.next_precise_index % len(providers)
-            )
-            if not start_route:
-                self.next_precise_index = (start + 1) % len(providers)
+            start = names.index(selected)
+        elif not providers:
+            raise GenerationError("没有启用精准参考的生图线路, 未提交生图")
+        elif precise:
+            start = self.next_precise_index % len(providers)
+            self.next_precise_index = (start + 1) % len(providers)
         else:
-            providers = self.providers
-            start = names.index(start_route) if start_route else self.next_index % len(providers)
-            if not start_route:
-                self.next_index = (start + 1) % len(providers)
-        for offset in range(len(providers)):
+            start = self.next_index % len(providers)
+            self.next_index = (start + 1) % len(providers)
+        for offset in range(1 if site_id else len(providers)):
             provider = providers[(start + offset) % len(providers)]
             try:
-                return await provider.generate(request), provider.name
+                outgoing = replace(request, request_mode=provider.request_mode)
+                return await provider.generate(outgoing), provider.name
             except GenerationError as exc:
                 errors.append(exc.message)
                 # Only explicit pre-generation rejection can select another route.
-                if exc.status not in (401, 403, 404):
+                if site_id or exc.status not in (401, 403, 404):
                     raise
         raise GenerationError("所有 NAI 图片连接均失败: " + " | ".join(errors))

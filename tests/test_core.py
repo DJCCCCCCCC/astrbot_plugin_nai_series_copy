@@ -79,8 +79,8 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(any(key.startswith("director_reference_") for key in params))
                 relay = OpenAIImagesProvider("relay", f"http://127.0.0.1:{self.port}", "test")
-                native_relay = OpenAIImagesProvider(
-                    "relay", f"http://127.0.0.1:{self.port}/relay", "test"
+                native_relay = OfficialNovelAIProvider(
+                    "relay", f"http://127.0.0.1:{self.port}/relay/v1", "test"
                 )
                 await relay.generate(
                     GenerationRequest(
@@ -156,24 +156,37 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "协议"):
             GenerationRequest("nai5", "cat", "", request_mode="bad")
 
-    async def test_native_mode_controls_all_generation_types(self):
+    async def test_each_site_applies_its_own_protocol_and_credentials(self):
+        base = f"http://127.0.0.1:{self.port}/relay"
         router = ProviderRouter(
             {
-                "primary_base_url": f"http://127.0.0.1:{self.port}/relay/v1",
-                "primary_api_key": "mock-key",
-                "primary_precise_reference": True,
+                "image_endpoints": [
+                    {
+                        "id": "native-relay",
+                        "base_url": base,
+                        "api_key": "native-key",
+                        "request_mode": "native",
+                        "supports_precise_reference": True,
+                    },
+                    {
+                        "id": "openai-relay",
+                        "base_url": base + "/v1",
+                        "api_key": "openai-key",
+                        "request_mode": "openai",
+                    },
+                ],
                 "use_stream": True,
             }
         )
         cases = (
             (
-                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="native"),
-                "/relay/v1/ai/generate-image",
+                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="openai"),
+                "native-relay",
                 4,
             ),
             (
-                GenerationRequest("nai-diffusion-4-5-full", "cat", "", request_mode="native"),
-                "/relay/v1/ai/generate-image",
+                GenerationRequest("nai-diffusion-4-5-full", "cat", ""),
+                "native-relay",
                 3,
             ),
             (
@@ -183,19 +196,13 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                     "",
                     action="img2img",
                     image=base64.b64encode(PNG).decode(),
-                    request_mode="native",
                 ),
-                "/relay/v1/ai/generate-image",
+                "native-relay",
                 4,
             ),
             (
-                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="openai"),
-                "/relay/v1/images/generations",
-                None,
-            ),
-            (
-                GenerationRequest("nai-diffusion-5-full", "cat", ""),
-                "/relay/v1/images/generations",
+                GenerationRequest("nai-diffusion-5-full", "cat", "", request_mode="native"),
+                "openai-relay",
                 None,
             ),
             (
@@ -205,22 +212,43 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                     "",
                     precise_reference_type="style",
                     precise_reference_image=base64.b64encode(PNG).decode(),
-                    request_mode="native",
                 ),
-                "/relay/v1/ai/generate-image",
+                "native-relay",
                 3,
             ),
         )
-        for request, path, version in cases:
-            with self.subTest(path=path, version=version, action=request.action):
-                await router.generate(request)
-                actual_path, payload = self.requests[-1]
-                self.assertEqual(actual_path, path)
+        for request, site_id, version in cases:
+            with self.subTest(site=site_id, version=version, action=request.action):
+                images, actual_id = await router.generate(request, site_id=site_id)
+                self.assertEqual((images[0].data, actual_id), (PNG, site_id))
+                path, payload = self.requests[-1]
                 if version:
+                    self.assertEqual(path, "/relay/v1/ai/generate-image")
+                    self.assertEqual(self.native_auth[-1], "Bearer native-key")
                     self.assertEqual(payload["parameters"]["params_version"], version)
                     self.assertNotIn("stream", payload)
                 else:
+                    self.assertEqual(path, "/relay/v1/images/generations")
+                    self.assertEqual(self.openai_auth[-1], "Bearer openai-key")
                     self.assertTrue(payload["stream"])
+
+        self.native_status = 401
+        ordinary = GenerationRequest("nai-diffusion-5-full", "cat", "")
+        attempted = len(self.requests)
+        with self.assertRaises(GenerationError) as rejection:
+            await router.generate(ordinary, site_id="native-relay")
+        self.assertEqual(rejection.exception.status, 401)
+        self.assertEqual(
+            [path for path, _ in self.requests[attempted:]], ["/relay/v1/ai/generate-image"]
+        )
+        self.assertEqual(router.next_index, 0)
+        attempted = len(self.requests)
+        _, actual_id = await router.generate(ordinary)
+        self.assertEqual(actual_id, "openai-relay")
+        self.assertEqual(
+            [path for path, _ in self.requests[attempted:]],
+            ["/relay/v1/ai/generate-image", "/relay/v1/images/generations"],
+        )
 
     def test_precise_reference_model_geometry(self):
         from astrbot_plugin_nai_series.references import normalize_image
@@ -261,10 +289,12 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.requests = []
         self.native_auth = []
+        self.openai_auth = []
         self.native_status = 200
 
         async def images(request):
             self.requests.append((request.path, await request.json()))
+            self.openai_auth.append(request.headers.get("Authorization"))
             return web.json_response({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
 
         async def official(request):
@@ -392,15 +422,22 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         )
         ordinary = GenerationRequest("nai-diffusion-5-full", "cat", "")
         unsupported = SimpleNamespace(
-            name="primary", supports_precise_reference=False, generate=AsyncMock(return_value=["a"])
+            name="primary",
+            request_mode="openai",
+            supports_precise_reference=False,
+            generate=AsyncMock(return_value=["a"]),
         )
         first = SimpleNamespace(
             name="secondary",
+            request_mode="native",
             supports_precise_reference=True,
             generate=AsyncMock(return_value=["b"]),
         )
         second = SimpleNamespace(
-            name="third", supports_precise_reference=True, generate=AsyncMock(return_value=["c"])
+            name="third",
+            request_mode="native",
+            supports_precise_reference=True,
+            generate=AsyncMock(return_value=["c"]),
         )
         router = ProviderRouter({})
         router.providers = [unsupported, first, second]
@@ -419,7 +456,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             await router.generate(request, start_route="secondary")
         second.generate.assert_not_awaited()
 
-    async def test_native_relay_uses_original_nai_payload_only_for_precise_reference(self):
+    async def test_native_relay_uses_original_nai_payload_with_precise_reference(self):
         encoded = base64.b64encode(PNG).decode()
         request = GenerationRequest(
             "nai-diffusion-5-full",
@@ -433,10 +470,15 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(url=url):
                 router = ProviderRouter(
                     {
-                        "primary_base_url": url,
-                        "primary_api_key": "mock-key",
-                        "primary_precise_reference": True,
-                        "primary_precise_reference_protocol": "openai",
+                        "image_endpoints": [
+                            {
+                                "id": "primary",
+                                "base_url": url,
+                                "api_key": "mock-key",
+                                "request_mode": "native",
+                                "supports_precise_reference": True,
+                            }
+                        ],
                         "use_stream": True,
                     }
                 )
@@ -468,9 +510,9 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(params["director_reference_information_extracted"], [1.0])
                 await router.generate(GenerationRequest(request.model, "cat", ""))
                 path, payload = self.requests[-1]
-                self.assertEqual(path, "/relay/v1/images/generations")
-                self.assertTrue(payload["stream"])
-                self.assertNotIn("parameters", payload)
+                self.assertEqual(path, "/relay/v1/ai/generate-image")
+                self.assertNotIn("stream", payload)
+                self.assertNotIn("director_reference_images", payload["parameters"])
 
         self.native_status = 201
         images, route = await router.generate(request)
@@ -490,6 +532,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 "primary_base_url": "https://relay.example/v1",
                 "primary_api_key": "test",
                 "primary_precise_reference": True,
+                "request_mode": "native",
                 "secondary_base_url": "https://relay2.example/v1",
                 "secondary_api_key": "test",
                 "third_base_url": "https://image.novelai.net",

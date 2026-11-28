@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -126,7 +127,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_retry_after_timeout_or_invalid_result(self):
         router = ProviderRouter({})
-        first, second = AsyncMock(), AsyncMock()
+        first = SimpleNamespace(name="first", request_mode="openai", generate=AsyncMock())
+        second = SimpleNamespace(name="second", request_mode="openai", generate=AsyncMock())
         first.generate.side_effect = GenerationError("timeout")
         router.providers = [first, second]
         with self.assertRaises(GenerationError):
@@ -135,13 +137,14 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_unavailable_route_can_switch_without_model_change(self):
         router = ProviderRouter({})
-        first, second = AsyncMock(), AsyncMock()
+        first = SimpleNamespace(name="first", request_mode="openai", generate=AsyncMock())
+        second = SimpleNamespace(name="second", request_mode="openai", generate=AsyncMock())
         first.generate.side_effect = GenerationError("not found", 404)
         second.generate.return_value = [GeneratedImage(png())]
         router.providers = [first, second]
         request = GenerationRequest("nai-diffusion-5-full", "style, cat", "bad5")
         await router.generate(request)
-        second.generate.assert_awaited_once_with(request)
+        second.generate.assert_awaited_once_with(replace(request, request_mode="openai"))
 
 
 class Event:
@@ -370,6 +373,61 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 plugin = NaiSeriesPlugin(context, config)
             self.assertEqual(len(plugin._tool_names), 2 if enabled else 0)
             self.assertEqual(context.add_llm_tools.call_count, 1 if enabled else 0)
+
+    def test_legacy_sites_migrate_into_editable_config_entries(self):
+        from astrbot.core.config.astrbot_config import AstrBotConfig
+
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        directory = Path(self.directory.name)
+        config_path = directory / "plugin_config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "request_mode": "openai",
+                    "primary_base_url": "https://relay.example/v1",
+                    "primary_api_key": "relay-key",
+                    "secondary_base_url": "https://image.novelai.net/v1",
+                    "secondary_api_key": "native-key",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("astrbot_plugin_nai_series.main.StarTools.get_data_dir", return_value=directory):
+            config = AstrBotConfig(str(config_path), schema=schema)
+            plugin = NaiSeriesPlugin(MagicMock(), config)
+            self.assertEqual(
+                [site.name for site in plugin.router.providers], ["primary", "secondary"]
+            )
+            self.assertEqual(plugin.router.precise_reference_routes, ["secondary"])
+            disk = AstrBotConfig(str(config_path), schema=schema)
+            self.assertEqual(
+                disk["image_endpoints"],
+                [
+                    {
+                        "__template_key": "image_endpoint",
+                        "id": "primary",
+                        "base_url": "https://relay.example/v1",
+                        "api_key": "relay-key",
+                        "request_mode": "openai",
+                        "supports_precise_reference": False,
+                    },
+                    {
+                        "__template_key": "image_endpoint",
+                        "id": "secondary",
+                        "base_url": "https://image.novelai.net/v1",
+                        "api_key": "native-key",
+                        "request_mode": "native",
+                        "supports_precise_reference": False,
+                    },
+                ],
+            )
+            self.assertFalse(disk.get("primary_api_key"))
+            self.assertFalse(disk.get("secondary_api_key"))
+            disk["image_endpoints"] = []
+            disk.save_config()
+            reloaded = NaiSeriesPlugin(MagicMock(), AstrBotConfig(str(config_path), schema=schema))
+            self.assertEqual(reloaded.router.providers, [])
 
     def test_configured_preset_name_is_persisted_as_stable_id(self):
         config = {
