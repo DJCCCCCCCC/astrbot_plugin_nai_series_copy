@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 import aiohttp
+from astrbot.api.message_components import At
 from PIL import Image as PILImage
 from PIL import ImageOps
 
@@ -218,6 +219,84 @@ async def _expand(event, scanned, strict=False):
     return result
 
 
+def qq_avatar_prompt(event, prompt):
+    """Bind current QQ mentions to ordered visual roles.
+
+    Args:
+        event: The current AstrBot event.
+        prompt: The parsed command prompt.
+
+    Returns:
+        The prompt with mentions replaced by role labels and the ordered QQ IDs.
+
+    Raises:
+        ValueError: Mentions cannot be safely mapped to the command prompt.
+    """
+    if event.get_platform_name() != "aiocqhttp":
+        return prompt, ()
+    message = getattr(event, "message_obj", None)
+    getter = getattr(event, "get_messages", None)
+    chain = getter() if callable(getter) else getattr(message, "message", [])
+    self_id = str(event.get_self_id() or "")
+    identifiers, tokens = [], {}
+    for item in chain:
+        if not isinstance(item, At):
+            continue
+        identifier = str(item.qq)
+        if identifier in ("all", self_id):
+            continue
+        if not re.fullmatch(r"[0-9]{5,12}", identifier, flags=re.ASCII):
+            raise ValueError("无法识别被提及的 QQ 用户，未提交生图")
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+        if len(identifiers) > 4:
+            raise ValueError("每次最多参考 4 个 QQ 用户头像，未提交生图")
+        token = re.sub(r"\s+", " ", f"@{item.name or ''}({identifier})")
+        if token not in tokens:
+            tokens[token] = [identifiers.index(identifier) + 1, 0]
+        tokens[token][1] += 1
+    if not identifiers:
+        return prompt, ()
+    prompt = re.sub(r"\s+", " ", prompt)
+    for token, (_, count) in tokens.items():
+        if prompt.count(token) != count:
+            raise ValueError("无法准确识别 @ 用户与描述的位置，请重新发送消息；未提交生图")
+    pattern = re.compile(
+        "|".join(re.escape(token) for token in sorted(tokens, key=len, reverse=True))
+    )
+    return pattern.sub(lambda match: f"角色{tokens[match.group()][0]}", prompt), tuple(identifiers)
+
+
+async def resolve_qq_avatars(ids):
+    """Fetch QQ avatars and normalize them for vision translation.
+
+    Args:
+        ids: QQ IDs in the same order as the corresponding role labels.
+
+    Returns:
+        The corresponding normalized PNG bytes, in the same order.
+
+    Raises:
+        ValueError: An avatar could not be obtained or validated.
+    """
+    if len(ids) > 4 or any(not re.fullmatch(r"[0-9]{5,12}", str(i), re.ASCII) for i in ids):
+        raise ValueError("QQ 头像请求无效，未提交生图")
+
+    async def fetch(identifier):
+        raw = await download_image(
+            f"https://q1.qlogo.cn/g?b=qq&nk={identifier}&s=640",
+            aiohttp.ClientTimeout(total=15),
+        )
+        return await asyncio.to_thread(normalize_image, raw, max_side=512)
+
+    results = await asyncio.gather(
+        *(fetch(identifier) for identifier in ids), return_exceptions=True
+    )
+    if any(isinstance(result, BaseException) for result in results):
+        raise ValueError("QQ 头像获取失败，请稍后重试；未提交生图") from None
+    return tuple(results)
+
+
 async def collect_images(event, *, strict=False, fetch_current=True, reply_only=False):
     message = getattr(event, "message_obj", None)
     getter = getattr(event, "get_messages", None)
@@ -281,7 +360,25 @@ async def _read_reference(event, ref, resolve=True):
     raise ValueError("参考图已失效, 请重新发图或引用原图消息")
 
 
-def normalize_image(data, size=None, *, precise=False, reference_model="nai5"):
+def vision_reference_size(data: bytes) -> str:
+    """Select a standard output size using the ordinary reference's orientation.
+
+    Args:
+        data: Normalized reference image bytes.
+
+    Returns:
+        The standard landscape, portrait, or square size label.
+    """
+    with PILImage.open(io.BytesIO(data)) as image:
+        width, height = image.size
+    if width * 5 > height * 6:
+        return "横图"
+    if height * 5 > width * 6:
+        return "竖图"
+    return "方图"
+
+
+def normalize_image(data, size=None, *, precise=False, reference_model="nai5", max_side=None):
     _validate_image(data)
     with PILImage.open(io.BytesIO(data)) as source:
         image = ImageOps.exif_transpose(source)
@@ -312,6 +409,8 @@ def normalize_image(data, size=None, *, precise=False, reference_model="nai5"):
             )
         else:
             image = image.convert("RGB")
+        if max_side:
+            image.thumbnail((max_side, max_side), PILImage.Resampling.LANCZOS)
         if not precise and size and image.size != size:
             image = image.resize(size, PILImage.Resampling.LANCZOS)
         output = io.BytesIO()

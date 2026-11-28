@@ -6,7 +6,6 @@ import json
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -330,7 +329,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         snapshot = self.plugin._state(event).last_request
         self.plugin.config["presets"][1]["artist_prompt"] = "changed"
         await self.execute(event, snapshot["model"], "", snapshot=snapshot)
-        self.assertEqual(asdict(self.plugin.router.generate.call_args.args[0]), snapshot)
+        self.assertEqual(
+            self.plugin.router.generate.call_args.args[0], GenerationRequest(**snapshot)
+        )
 
     def test_curated_keeps_family_preset_without_overriding_model(self):
         self.plugin.config["model_nai4"] = "nai-diffusion-4-5-curated"

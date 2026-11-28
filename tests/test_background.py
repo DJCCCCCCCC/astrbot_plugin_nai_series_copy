@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import io
 import json
 import threading
 import time
@@ -142,6 +143,50 @@ class BackgroundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.plugin.canvas_generate()).status_code, 409)
             self.assertEqual(self.plugin.store.jobs(), [])
             self.plugin.router.generate.assert_not_awaited()
+
+    async def test_canvas_combines_ordinary_and_precise_references_in_one_job(self):
+        from PIL import Image
+
+        self.plugin.config["request_mode"] = "native"
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="POSITIVE: castle, rain")
+        self.plugin.router.precise_reference_routes = ["primary"]
+        background = io.BytesIO()
+        Image.new("RGB", (32, 16), "green").save(background, "PNG")
+        data = {
+            "prompt": "画夜雨里的角色",
+            "model": "nai5",
+            "request_mode": "native",
+            "translator": self.plugin.translator.models[0],
+            "vision_reference_image": base64.b64encode(background.getvalue()).decode(),
+            "reference_type": "角色",
+            "reference_image": base64.b64encode(png()).decode(),
+        }
+        request = SimpleNamespace(username="alice", json=AsyncMock(return_value=data))
+        with patch("astrbot_plugin_nai_series.main.web_request", request):
+            request.json.return_value = {**data, "raw": True}
+            self.assertEqual((await self.plugin.canvas_generate()).status_code, 400)
+            request.json.return_value = data
+            response = await self.plugin.canvas_generate()
+            self.assertEqual(response.status_code, 200)
+            await self.finish()
+        self.plugin.translator.translate.assert_awaited_once()
+        args, kwargs = self.plugin.translator.translate.await_args
+        self.assertEqual(args, (data["prompt"],))
+        self.assertEqual(kwargs["start_model"], data["translator"])
+        self.assertTrue(kwargs["scene_reference"])
+        with Image.open(io.BytesIO(kwargs["image"])) as image:
+            self.assertEqual(image.size, (32, 16))
+        self.plugin.router.generate.assert_awaited_once()
+        outgoing = self.plugin.router.generate.await_args.args[0]
+        self.assertIn("castle, rain", outgoing.prompt)
+        self.assertEqual(outgoing.precise_reference_type, "character")
+        self.assertEqual(outgoing.action, "generate")
+        self.assertNotEqual(base64.b64decode(outgoing.precise_reference_image), kwargs["image"])
+        job = self.plugin.store.jobs()[0]
+        self.assertEqual(job["state"], "delivered")
+        self.assertTrue(job["vision_reference_id"])
+        self.assertNotEqual(job["vision_reference_id"], job["request"]["precise_reference_id"])
 
     async def test_canvas_queued_jobs_keep_request_mode_after_change(self):
         class Config(dict):

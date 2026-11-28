@@ -401,6 +401,56 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             await translator.translate("cat", image=b"bad")
 
     @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_avatar_translation_sends_each_labeled_image_separately(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("POSITIVE: two characters\nCHAR1: red hair\nCHAR2: blue hair"))
+        translator = PromptTranslator(
+            {"translator_base_url": self.base_url, "translator_api_key": "test"}
+        )
+        await translator.translate("角色1 追赶 角色2", avatars=(PNG, PNG))
+        system, user = self.requests[-1][1]["messages"]
+        self.assertIn("visible appearance", system["content"])
+        self.assertEqual(
+            [part["type"] for part in user["content"]],
+            ["text", "text", "image_url", "text", "image_url"],
+        )
+        self.assertEqual(user["content"][0]["text"], "角色1 追赶 角色2")
+        self.assertIn("角色1 / CHAR1", user["content"][1]["text"])
+        self.assertEqual(user["content"][2]["image_url"]["url"], URI)
+        self.assertIn("角色2 / CHAR2", user["content"][3]["text"])
+        self.assertEqual(user["content"][4]["image_url"]["url"], URI)
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
+    async def test_scene_reference_only_uses_scene_image_and_respects_user_text(self):
+        from astrbot_plugin_nai_series.translator import PromptTranslator
+
+        self.set_json(chat("POSITIVE: running, moonlit street"))
+        translator = PromptTranslator(
+            {
+                "translator_base_url": self.base_url,
+                "translator_api_key": "test",
+                "translator_system_prompt": "custom NAI rules",
+            }
+        )
+        result = await translator.translate(
+            "保留奔跑动作，改成夜晚", image=PNG, scene_reference=True
+        )
+        self.assertEqual(result, "POSITIVE: running, moonlit street")
+        system, user = self.requests[-1][1]["messages"]
+        self.assertIn("custom NAI rules", system["content"])
+        self.assertIn("setting, actions, pose, composition", system["content"])
+        self.assertIn("do not copy or infer the primary subject's identity", system["content"])
+        self.assertIn("Respect explicit user instructions", system["content"])
+        self.assertEqual(user["content"][0]["text"], "保留奔跑动作，改成夜晚")
+        self.assertEqual(len(user["content"]), 2)
+        self.assertEqual(user["content"][1]["image_url"]["url"], URI)
+        with self.assertRaisesRegex(ValueError, "场景参考"):
+            await translator.translate("cat", scene_reference=True)
+        with self.assertRaisesRegex(ValueError, "场景参考"):
+            await translator.translate("cat", image=PNG, avatars=(PNG,), scene_reference=True)
+
+    @unittest.skipUnless(HAS_ASTRBOT, "Requires AstrBot")
     async def test_selected_translator_does_not_change_global_rotation(self):
         from astrbot_plugin_nai_series.translator import PromptTranslator
 

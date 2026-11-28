@@ -164,6 +164,7 @@ class Store:
                     job.get("vision_reference_id"),
                 )
             )
+            keep.update(job.get("avatar_reference_ids", ()))
         with self.connect() as db:
             for (value,) in db.execute("SELECT value FROM state"):
                 state = json.loads(value)

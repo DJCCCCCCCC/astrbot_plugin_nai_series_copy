@@ -34,6 +34,82 @@ PNG = _buffer.getvalue()
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_character_prompt_validation_and_json_round_trip(self):
+        from dataclasses import asdict
+
+        request = GenerationRequest("nai5", "scene", "bad", character_prompts=[" girl ", "boy"])
+        self.assertEqual(request.character_prompts, ("girl", "boy"))
+        restored = GenerationRequest(**json.loads(json.dumps(asdict(request))))
+        self.assertEqual(restored.character_prompts, ("girl", "boy"))
+        for invalid in ("girl", [""], ["   "], [5], ["a"] * 5, ["a" * 2001]):
+            with self.subTest(invalid_type=type(invalid).__name__):
+                with self.assertRaises(ValueError):
+                    GenerationRequest("nai5", "scene", "", character_prompts=invalid)
+        for model in ("custom", "nai-diffusion-3"):
+            with self.assertRaisesRegex(ValueError, "NAI"):
+                GenerationRequest(model, "scene", "", character_prompts=("girl",))
+        with self.assertRaisesRegex(ValueError, "文生图"):
+            GenerationRequest(
+                "nai5", "scene", "", action="img2img", image="image", character_prompts=("girl",)
+            )
+
+    async def test_character_prompts_native_and_openai_requests(self):
+        prompts = ("red hair, smiling", "blue hair, reading")
+        for model in ("nai-diffusion-4-5-full", "nai-diffusion-5-full"):
+            with self.subTest(model=model):
+                native = OfficialNovelAIProvider("native", f"http://127.0.0.1:{self.port}", "test")
+                await native.generate(
+                    GenerationRequest(
+                        model, "two people", "bad", character_prompts=prompts, request_mode="openai"
+                    )
+                )
+                params = self.requests[-1][1]["parameters"]
+                self.assertEqual(
+                    params["params_version"], 4 if model.startswith("nai-diffusion-5-") else 3
+                )
+                self.assertEqual(params["v4_prompt"]["caption"]["base_caption"], "two people")
+                self.assertEqual(
+                    params["v4_prompt"]["caption"]["char_captions"],
+                    [{"char_caption": item, "centers": [{"x": 0.5, "y": 0.5}]} for item in prompts],
+                )
+                self.assertTrue(params["v4_prompt"]["use_order"])
+                self.assertEqual(
+                    params["v4_negative_prompt"]["caption"]["char_captions"],
+                    [{"char_caption": "", "centers": [{"x": 0.5, "y": 0.5}]}] * 2,
+                )
+                self.assertFalse(any(key.startswith("director_reference_") for key in params))
+                relay = OpenAIImagesProvider("relay", f"http://127.0.0.1:{self.port}", "test")
+                native_relay = OpenAIImagesProvider(
+                    "relay", f"http://127.0.0.1:{self.port}/relay", "test"
+                )
+                await relay.generate(
+                    GenerationRequest(
+                        model, "two people", "bad", character_prompts=prompts, request_mode="openai"
+                    )
+                )
+                path, payload = self.requests[-1]
+                self.assertEqual(path, "/v1/images/generations")
+                self.assertEqual(
+                    payload["prompt"],
+                    "two people\n\nCharacter 1: red hair, smiling\nCharacter 2: blue hair, reading",
+                )
+                self.assertEqual(payload["negative_prompt"], "bad")
+                self.assertFalse(any(key.startswith("director_reference_") for key in payload))
+                await native_relay.generate(
+                    GenerationRequest(
+                        model, "two people", "bad", character_prompts=prompts, request_mode="native"
+                    )
+                )
+                path, payload = self.requests[-1]
+                self.assertEqual(path, "/relay/v1/ai/generate-image")
+                self.assertEqual(
+                    [
+                        item["char_caption"]
+                        for item in payload["parameters"]["v4_prompt"]["caption"]["char_captions"]
+                    ],
+                    list(prompts),
+                )
+
     def test_reference_capabilities_and_validation(self):
         for model in ("nai4", "nai-diffusion-4-5-curated"):
             self.assertEqual(reference_strength_max(model), 1.0)

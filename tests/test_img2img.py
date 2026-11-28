@@ -466,6 +466,103 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image.size, (832, 1216))
         self.assertEqual(request.size, "1216x832")
 
+    async def test_explicit_scene_and_precise_reference_stay_separate(self):
+        from PIL import Image
+
+        buffers = []
+        for color in ("red", "blue"):
+            output = io.BytesIO()
+            Image.new("RGB", (64, 64), color).save(output, format="PNG")
+            buffers.append(output.getvalue())
+        self.plugin.config["request_mode"] = "native"
+        self.plugin.router.precise_reference_routes = ["primary"]
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(
+            return_value="POSITIVE: two people\nUNDESIRED: blurry"
+        )
+        for flag, expected in (("角色", "character"), ("服装", "costume")):
+            with self.subTest(flag=flag):
+                self.plugin.translator.translate.reset_mock()
+                self.plugin.router.generate.reset_mock()
+                event = message_event([image_segment(buffers[0]), image_segment(buffers[1])])
+                result = [
+                    item
+                    async for item in self.plugin.cmd_nai5(event, f"替换人物 --参考 1 --{flag} 2")
+                ]
+                self.assertIn("已提交", str(result))
+                await self.finish()
+                args, kwargs = self.plugin.translator.translate.await_args
+                self.assertEqual(args[0], "替换人物")
+                self.assertTrue(kwargs["scene_reference"])
+                with Image.open(io.BytesIO(kwargs["image"])) as image:
+                    self.assertEqual(image.convert("RGB").getpixel((0, 0)), (255, 0, 0))
+                outbound = self.plugin.router.generate.await_args.args[0]
+                self.assertEqual(outbound.action, "generate")
+                self.assertFalse(outbound.image)
+                self.assertEqual(outbound.precise_reference_type, expected)
+                with Image.open(
+                    io.BytesIO(base64.b64decode(outbound.precise_reference_image))
+                ) as image:
+                    self.assertEqual(image.convert("RGB").getpixel((0, 0)), (0, 0, 255))
+                self.assertNotEqual(
+                    kwargs["image"], base64.b64decode(outbound.precise_reference_image)
+                )
+
+    async def test_explicit_reference_options_work_independently(self):
+        self.plugin.config["request_mode"] = "native"
+        self.plugin.router.precise_reference_routes = ["primary"]
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="POSITIVE: cat")
+        event = message_event([image_segment()])
+        result = [item async for item in self.plugin.cmd_nai5(event, "猫 --参考 1")]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        self.assertTrue(self.plugin.translator.translate.await_args.kwargs["image"])
+        self.assertFalse(self.plugin.router.generate.await_args.args[0].precise_reference_type)
+        self.plugin.translator.translate.reset_mock()
+        result = [item async for item in self.plugin.cmd_nai5(event, "猫 --角色 1")]
+        self.assertIn("已提交", str(result))
+        await self.finish()
+        self.assertEqual(
+            self.plugin.router.generate.await_args.args[0].precise_reference_type, "character"
+        )
+        self.assertNotIn("image", self.plugin.translator.translate.await_args.kwargs)
+
+    async def test_explicit_reference_rejects_conflicts_and_bad_indices(self):
+        self.plugin.config["request_mode"] = "native"
+        self.plugin.router.precise_reference_routes = ["primary"]
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(return_value="cat")
+        for flags in (
+            "--参考 1 --角色 1",
+            "--角色 1 --服装 2",
+            "--参考 0",
+            "--参考 3",
+            "--参考 x",
+            "--参考 1 --raw",
+            "--参考 1 --ref 风格",
+            "--参考 1 --image 1",
+            "--参考 1 --img2img",
+            "--参考 1 --strength 0.5",
+            "--参考 1 --noise 0.2",
+            "--角色 1 --ref 风格",
+            "--角色 1 --image 1",
+            "--角色 1 --img2img",
+            "--角色 1 --strength 0.5",
+            "--角色 1 --noise 0.2",
+        ):
+            with self.subTest(flags=flags):
+                output = io.BytesIO()
+                from PIL import Image
+
+                Image.new("RGB", (64, 64), "blue").save(output, format="PNG")
+                event = message_event([image_segment(), image_segment(output.getvalue())])
+                result = [item async for item in self.plugin.cmd_nai5(event, "猫 " + flags)]
+                self.assertIn("未完成", str(result))
+        self.plugin.translator.translate.assert_not_awaited()
+        self.plugin.router.generate.assert_not_awaited()
+        self.assertEqual(self.plugin.store.jobs(), [])
+
     async def test_precise_metadata_message_and_successful_quota(self):
         self.plugin.config["request_mode"] = "native"
         from PIL import Image
@@ -484,7 +581,7 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
             (
                 {"director_reference_descriptions": [{"caption": {"base_caption": "costume"}}]},
                 "parameters_present",
-                "包含精准参考参数",
+                "",
             ),
             (None, "unknown", "无法从结果元数据验证"),
         )
@@ -507,8 +604,9 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(job["state"], "delivered")
                 self.assertEqual(job["precise_reference_status"], status)
                 chain = self.plugin.context.send_message.await_args.args[1].chain
-                self.assertEqual(len(chain), 2)
-                self.assertIn(text, chain[1].text)
+                self.assertEqual(len(chain), 2 if text else 1)
+                if text:
+                    self.assertIn(text, chain[1].text)
                 with self.plugin.store.connect() as db:
                     self.assertEqual(
                         db.execute(
@@ -517,6 +615,56 @@ class PluginImg2ImgTests(unittest.IsolatedAsyncioTestCase):
                         "generated",
                     )
         self.assertEqual(self.plugin.router.generate.await_count, 3)
+
+    async def test_qq_mentions_are_separate_ordinary_avatar_references(self):
+        from astrbot.api.message_components import At, Plain
+
+        event = message_event(
+            [
+                At(qq="10001", name="甲"),
+                Plain("与"),
+                At(qq="10002", name="乙"),
+                Plain("打架"),
+            ]
+        )
+        event.get_platform_name = lambda: "aiocqhttp"
+        event.get_self_id = lambda: "90001"
+        self.plugin.translator.enabled = True
+        self.plugin.translator.translate = AsyncMock(
+            return_value=(
+                "POSITIVE: two characters, fighting\n"
+                "UNDESIRED: blurry\n"
+                "CHAR2: blue hair, dodging\n"
+                "CHAR1: red hair, advancing"
+            )
+        )
+        data = (png(), png())
+        with patch(
+            "astrbot_plugin_nai_series.main.resolve_qq_avatars", AsyncMock(return_value=data)
+        ) as resolve:
+            results = [
+                item async for item in self.plugin.cmd_nai5(event, "@甲(10001) 与 @乙(10002) 打架")
+            ]
+            self.assertIn("已提交", str(results))
+            resolve.assert_awaited_once_with(("10001", "10002"))
+            await self.finish()
+            self.plugin.translator.translate.assert_awaited_once_with(
+                "角色1 与 角色2 打架", avatars=data
+            )
+            sent = self.plugin.router.generate.await_args.args[0]
+            self.assertEqual(sent.character_prompts, ("red hair, advancing", "blue hair, dodging"))
+            self.assertEqual(sent.action, "generate")
+            self.assertFalse(sent.precise_reference_type)
+            self.assertIn("two characters, fighting", sent.prompt)
+            self.assertNotIn("red hair", sent.prompt)
+            self.assertIn("blurry", sent.negative_prompt)
+            self.plugin.translator.translate.return_value = "POSITIVE: cat\nCHAR1: red hair"
+            [item async for item in self.plugin.cmd_nai5(event, "@甲(10001) 与 @乙(10002) 打架")]
+            await self.finish()
+            self.assertEqual(self.plugin.router.generate.await_count, 1)
+            records = self.plugin.store.jobs(owner=self.plugin._key(event), limit=1)
+            self.assertEqual(records[0]["state"], "failed")
+            self.assertIn("分别描述", records[0]["generation_error"])
 
     async def test_precise_reference_invalid_requests_never_generate(self):
         self.plugin.config["request_mode"] = "native"

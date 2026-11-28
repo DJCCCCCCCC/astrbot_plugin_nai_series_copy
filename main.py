@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import hashlib
-import io
 import json
 import math
 import re
@@ -21,7 +20,6 @@ from astrbot.api.web import request as web_request
 from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.star.filter.command import GreedyStr
-from PIL import Image as PILImage
 
 from .background import ACTIVE, LABELS, BackgroundQueue
 from .commands import generation_args, resolve_size
@@ -38,10 +36,18 @@ from .models import (
     reference_types,
 )
 from .providers import GenerationError, ProviderRouter
-from .references import collect_images, inspect_precise_reference, normalize_image, resolve_image
+from .references import (
+    collect_images,
+    inspect_precise_reference,
+    normalize_image,
+    qq_avatar_prompt,
+    resolve_image,
+    resolve_qq_avatars,
+    vision_reference_size,
+)
 from .storage import Store
 from .tools import make_tools
-from .translator import PromptTranslator, split_translated_prompt
+from .translator import PromptTranslator, split_avatar_prompt, split_translated_prompt
 
 NAI_TOOLS = tuple(
     f"{family}_{mode}_image" for family in ("nai4", "nai5") for mode in ("generate", "edit")
@@ -380,6 +386,8 @@ class NaiSeriesPlugin(Star):
 
     async def _reference_flags(self, event, model, prompt, flags, describe_reply=False):
         self._check_access(event)
+        if any(key in flags for key in ("参考", "角色", "服装")):
+            return await self._explicit_reference_flags(event, model, prompt, flags)
         if "ref-strength" in flags and "ref" not in flags:
             raise ValueError("使用 --ref-strength 时也需要通过 --ref 指定精准参考类型")
         if "ref" in flags:
@@ -426,16 +434,7 @@ class NaiSeriesPlugin(Star):
                     raise ValueError("引用图片需要启用支持图片的翻译模型, 未提交生图")
                 data = await resolve_image(event, flags.get("image"), candidates=quoted)
                 if "size" not in flags:
-                    with PILImage.open(io.BytesIO(data)) as image:
-                        width, height = image.size
-                    size = (
-                        "横图"
-                        if width * 5 > height * 6
-                        else "竖图"
-                        if height * 5 > width * 6
-                        else "方图"
-                    )
-                    flags = {**flags, "size": size}
+                    flags = {**flags, "size": vision_reference_size(data)}
                 return {
                     **flags,
                     "vision_reference_id": self.store.save_reference(self._key(event), data),
@@ -463,6 +462,84 @@ class NaiSeriesPlugin(Star):
         except TimeoutError:
             raise ValueError("参考图读取超时, 请重新发图") from None
         return {**flags, "reference_id": self.store.save_reference(self._key(event), data)}
+
+    async def _explicit_reference_flags(self, event, model, prompt, flags):
+        """Validate and prepare explicitly indexed visual and precise references.
+
+        Args:
+            event: Chat message that supplies the referenced images.
+            model: Target generation model.
+            prompt: User's scene description.
+            flags: Parsed command flags.
+
+        Returns:
+            Generation flags with the stored references and precise type.
+
+        Raises:
+            ValueError: The requested combination or image selection is invalid.
+        """
+        if any(key in flags for key in ("ref", "image", "img2img", "strength", "noise")):
+            raise ValueError(
+                "请用 --参考、--角色 或 --服装 指定图片，避免与已有参考或图生图参数混用"
+            )
+        if "角色" in flags and "服装" in flags:
+            raise ValueError("--角色 和 --服装 只能选一个")
+        precise = "角色" if "角色" in flags else "服装" if "服装" in flags else ""
+        visual = "参考" in flags
+        if visual and (flags.get("raw") or not self.translator.enabled):
+            raise ValueError("--参考 需要启用支持图片的翻译模型并使用翻译")
+        if "ref-strength" in flags and not precise:
+            raise ValueError("--ref-strength 需要配合 --角色 或 --服装")
+        selections = {key: flags[key] for key in ("参考", precise) if key in flags}
+        if any(not re.fullmatch(r"[1-9][0-9]{0,2}", index) for index in selections.values()):
+            raise ValueError("图片序号必须是从 1 开始的整数")
+        if len(set(selections.values())) != len(selections):
+            raise ValueError("普通参考和精准参考请选择不同的图片")
+        result = {key: value for key, value in flags.items() if key not in selections}
+        validation = result
+        if precise:
+            result["ref"] = precise
+            validation = {**result, "precise_reference_id": "0" * 64}
+        self._request(
+            model,
+            prompt or ("image" if visual else prompt),
+            self._preset(event, model, result.get("preset")),
+            validation,
+        )
+        if precise:
+            self._check_precise_route(
+                self.request_mode, str(result.get("route", "")).strip().lower()
+            )
+        try:
+            async with asyncio.timeout(30):
+                candidates = await collect_images(event, strict=True, fetch_current=False)
+                images = await asyncio.gather(
+                    *(
+                        resolve_image(
+                            event,
+                            index,
+                            candidates=candidates,
+                            precise=key == precise,
+                            reference_model=model,
+                        )
+                        for key, index in selections.items()
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            raise ValueError("参考图读取超时，请重新附图或引用") from None
+        for key, image in zip(selections, images, strict=True):
+            if isinstance(image, (ValueError, GenerationError)):
+                raise ValueError(f"--{key} 图片读取失败。{image}") from None
+            if isinstance(image, BaseException):
+                raise image
+        owner = self._key(event)
+        for key, image in zip(selections, images, strict=True):
+            target = "vision_reference_id" if key == "参考" else "precise_reference_id"
+            result[target] = self.store.save_reference(owner, image)
+            if key == "参考" and "size" not in result:
+                result["size"] = vision_reference_size(image)
+        return result
 
     def _check_access(self, event):
         if self.config.get("admin_only", False) and not event.is_admin():
@@ -523,6 +600,7 @@ class NaiSeriesPlugin(Star):
                 "request": asdict(draft),
                 "original_prompt": prompt,
                 "vision_reference_id": flags.get("vision_reference_id", ""),
+                "avatar_reference_ids": flags.get("avatar_reference_ids", ()),
                 "artist": preset.artist_prompt if preset else "",
                 "raw": bool(snapshot or flags.get("raw")),
                 "silent": silent,
@@ -998,14 +1076,19 @@ class NaiSeriesPlugin(Star):
             owner = "dashboard:" + hashlib.sha256(username.encode()).hexdigest()
             reference_type = data.get("reference_type", "")
             reference_image = data.get("reference_image", "")
-            if not isinstance(reference_type, str) or not isinstance(reference_image, str):
+            vision_reference_image = data.get("vision_reference_image", "")
+            raw = bool(data.get("raw", False))
+            if any(
+                not isinstance(value, str)
+                for value in (reference_type, reference_image, vision_reference_image)
+            ):
                 raise ValueError("参考图参数无效")
+            if vision_reference_image and (raw or not self.translator.enabled):
+                raise ValueError("普通参考图需要启用支持图片的翻译模型并使用翻译")
             if reference_type or reference_image or "reference_strength" in data:
                 self._check_precise_route(mode)
                 if not reference_type or not reference_image:
                     raise ValueError("请同时选择参考类型并上传参考图")
-                if len(reference_image) > (CANVAS_REFERENCE_LIMIT + 2) // 3 * 4:
-                    raise ValueError("参考图不得超过 8 MB")
                 strength = data.get("reference_strength", 1.0)
                 if isinstance(strength, bool) or not isinstance(strength, (int, float)):
                     raise ValueError("精准参考强度必须是数字")
@@ -1015,21 +1098,51 @@ class NaiSeriesPlugin(Star):
                     **{"ref-strength": strength},
                 )
             draft = self._request(model, prompt, preset, flags)
-            if reference_type:
+            vision_reference_id = ""
+            if reference_image or vision_reference_image:
+                if (
+                    len(vision_reference_image) + len(reference_image)
+                    > (CANVAS_REFERENCE_LIMIT + 2) // 3 * 4 + 4
+                ):
+                    raise ValueError("参考图合计不得超过 8 MB")
                 try:
                     raw_image = base64.b64decode(reference_image, validate=True)
+                    raw_vision = base64.b64decode(vision_reference_image, validate=True)
                 except ValueError:
                     raise ValueError("参考图编码无效") from None
-                if len(raw_image) > CANVAS_REFERENCE_LIMIT:
-                    raise ValueError("参考图不得超过 8 MB")
-                reference = await asyncio.to_thread(
-                    normalize_image, raw_image, precise=True, reference_model=model
+                if len(raw_image) + len(raw_vision) > CANVAS_REFERENCE_LIMIT:
+                    raise ValueError("参考图合计不得超过 8 MB")
+                inputs = {
+                    "vision_reference_id": raw_vision,
+                    "precise_reference_id": raw_image,
+                }
+                selected = {key: payload for key, payload in inputs.items() if payload}
+                prepared = await asyncio.gather(
+                    *(
+                        asyncio.to_thread(
+                            normalize_image,
+                            payload,
+                            precise=key == "precise_reference_id",
+                            reference_model=model,
+                        )
+                        for key, payload in selected.items()
+                    ),
+                    return_exceptions=True,
                 )
+                for reference in prepared:
+                    if isinstance(reference, BaseException):
+                        raise reference
                 if self.request_mode != mode:
                     return error_response("请求模式已变更，请刷新画布后再提交", status_code=409)
-                draft = replace(
-                    draft, precise_reference_id=self.store.save_reference(owner, reference)
-                )
+                reference_ids = {
+                    key: self.store.save_reference(owner, reference)
+                    for key, reference in zip(selected, prepared, strict=True)
+                }
+                vision_reference_id = reference_ids.get("vision_reference_id", "")
+                if reference_type:
+                    draft = replace(
+                        draft, precise_reference_id=reference_ids["precise_reference_id"]
+                    )
             task_id = self.queue.submit(
                 {
                     "owner": owner,
@@ -1039,9 +1152,10 @@ class NaiSeriesPlugin(Star):
                     "umo": "",
                     "request": asdict(draft),
                     "original_prompt": prompt,
+                    "vision_reference_id": vision_reference_id,
                     "artist": preset.artist_prompt if preset else "",
                     "translator": translator,
-                    "raw": bool(data.get("raw", False)),
+                    "raw": raw,
                     "silent": True,
                     "preview": None,
                     "batch_id": "",
@@ -1106,11 +1220,31 @@ class NaiSeriesPlugin(Star):
                         )
                     except OSError:
                         raise GenerationError("引用图片已失效, 未提交生成") from None
+                avatar_ids = job.get("avatar_reference_ids", ())
+                try:
+                    avatars = tuple(
+                        await asyncio.gather(
+                            *(
+                                asyncio.to_thread(self.store.reference_path(identifier).read_bytes)
+                                for identifier in avatar_ids
+                            )
+                        )
+                    )
+                except (OSError, ValueError):
+                    raise GenerationError("头像参考已失效，未提交生图") from None
                 queue.transition(job, "translating")
                 prompt = job["original_prompt"]
+                character_prompts = ()
                 try:
-                    if vision_image is not None:
-                        translated = await self.translator.translate(prompt, image=vision_image)
+                    if avatars:
+                        translated = await self.translator.translate(prompt, avatars=avatars)
+                    elif vision_image is not None:
+                        vision_args = {"image": vision_image}
+                        if job.get("translator"):
+                            vision_args["start_model"] = job["translator"]
+                        if precise_reference_id:
+                            vision_args["scene_reference"] = True
+                        translated = await self.translator.translate(prompt, **vision_args)
                     elif job["raw"]:
                         translated = prompt
                     elif job.get("translator"):
@@ -1119,7 +1253,11 @@ class NaiSeriesPlugin(Star):
                         )
                     else:
                         translated = await self.translator.translate(prompt)
-                    if not job["raw"]:
+                    if avatars:
+                        positive, negative, character_prompts = split_avatar_prompt(
+                            translated, len(avatars)
+                        )
+                    elif not job["raw"]:
                         positive, negative = split_translated_prompt(translated)
                         if translated != prompt and positive == translated:
                             positive = ", ".join(translated.splitlines())
@@ -1138,6 +1276,7 @@ class NaiSeriesPlugin(Star):
                             if negative
                             else draft.negative_prompt
                         ),
+                        character_prompts=character_prompts,
                     )
                 )
                 if (
@@ -1231,10 +1370,11 @@ class NaiSeriesPlugin(Star):
                 status = job.get("precise_reference_status", "unknown")
                 message = {
                     "not_applied": "精准参考未生效：结果元数据显示参考参数为空。图片已生成，未自动重试。",
-                    "parameters_present": "结果元数据包含精准参考参数，实际相似度取决于模型。",
+                    "parameters_present": "",
                     "unknown": "无法从结果元数据验证精准参考是否生效。图片已生成，未自动重试。",
                 }.get(status, "无法从结果元数据验证精准参考是否生效。图片已生成，未自动重试。")
-                components.append(Plain(message))
+                if message:
+                    components.append(Plain(message))
             await self._send(job["umo"], components)
             queue.transition(job, "delivered")
             logger.info(
@@ -1296,6 +1436,18 @@ class NaiSeriesPlugin(Star):
             if family in ("nai4", "nai5") and model_family(model) != family:
                 raise ValueError(f"请使用 /{model_family(model)} 调用另一模型族")
             flags = await self._reference_flags(event, model, prompt, flags, describe_reply=True)
+            if not any(flags.get(key) for key in ("ref", "img2img", "vision_reference_id")):
+                prompt, mentioned = qq_avatar_prompt(event, prompt)
+                if mentioned:
+                    if flags.get("raw") or not self.translator.enabled:
+                        raise ValueError("头像参考需要启用支持图片的翻译模型并使用翻译")
+                    if not reference_types(model):
+                        raise ValueError("头像参考需要支持角色提示词的 NAI 4.5 或 NAI 5 模型")
+                    avatars = await resolve_qq_avatars(mentioned)
+                    owner = self._key(event)
+                    flags["avatar_reference_ids"] = tuple(
+                        self.store.save_reference(owner, avatar) for avatar in avatars
+                    )
             self._submit(
                 event,
                 model,
@@ -1682,7 +1834,9 @@ class NaiSeriesPlugin(Star):
             "图生图: 附图或引用图片 + /nai图生图 描述 --model nai5\n"
             "精准参考（需切换到 NovelAI 原生模式）\n"
             "附图或引用图片后发送 /nai5 描述 --ref 角色＋风格\n"
+            "双图参考可发 /nai5 描述 --参考 1 --角色 2，也可用 --服装 2。图片按附图在前、引用图在后的顺序编号。\n"
             "参考类型有角色、风格、角色＋风格。NAI 5 还支持服装。\n"
+            "QQ 可在描述里 @ 用户，把头像分别用作角色外观参考。需要支持图片的翻译模型。\n"
             "/nai4、/nai5、/nai生图: 附图自动图生图; 引用图片先生成提示词再文生图\n"
             "--strength 0.6 --noise 0.1; 多图用 --image 1 选择; --img2img 可强制要求参考图\n"
             "步数支持 1-28; /nai重绘 沿用上次参考图重新生成\n"

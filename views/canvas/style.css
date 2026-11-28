@@ -131,7 +131,7 @@ summary { cursor: pointer; font-size: 14px; font-weight: 650; color: var(--accen
 .mode-group { margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
 .mode-title, .reference-fields legend { font-size: 14px; font-weight: 700; }
 .mode-buttons { display: flex; gap: 8px; margin-top: 10px; }
-.mode-buttons button, #clear-reference {
+.mode-buttons button, #clear-reference, #clear-vision-reference {
   padding: 8px 10px;
   border: 1px solid var(--field-border);
   border-radius: 8px;
@@ -145,7 +145,7 @@ summary { cursor: pointer; font-size: 14px; font-weight: 650; color: var(--accen
 .reference-fields { min-width: 0; margin: 20px 0 0; padding: 0; border: 0; }
 .reference-fields label { margin: 14px 0 8px; }
 .reference-fields input[type="file"] { padding: 8px; font-size: 13px; }
-#clear-reference { margin-top: 12px; }
+#clear-reference, #clear-vision-reference { margin-top: 12px; }
 
 #submit {
   width: 100%;

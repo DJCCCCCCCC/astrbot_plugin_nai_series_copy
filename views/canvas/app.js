@@ -16,6 +16,9 @@ const referenceImage = document.querySelector('#reference-image');
 const referenceStrength = document.querySelector('#reference-strength');
 const referenceHint = document.querySelector('#reference-hint');
 const clearReference = document.querySelector('#clear-reference');
+const visionReferenceImage = document.querySelector('#vision-reference-image');
+const clearVisionReference = document.querySelector('#clear-vision-reference');
+const visionReferenceHint = document.querySelector('#vision-reference-hint');
 const referenceNames = {character: '角色', style: '风格', 'character&style': '角色＋风格', costume: '服装'};
 let options;
 let requestMode;
@@ -33,6 +36,12 @@ const updateReference = () => {
   referenceImage.disabled = !enabled || busy;
   referenceStrength.disabled = !enabled || busy || !selected;
   clearReference.disabled = busy;
+  const visionEnabled = options.translator_enabled && !raw.checked;
+  visionReferenceImage.disabled = !visionEnabled || busy;
+  clearVisionReference.disabled = busy;
+  visionReferenceHint.textContent = visionEnabled
+    ? `支持 PNG、JPEG、WebP，与精准参考图合计不超过 ${Math.floor(options.reference_max_bytes / 1048576)} MiB；图片会发送至翻译服务。`
+    : '需要启用支持图片输入的翻译模型，并关闭“使用原文”。';
   referenceStrength.max = family.reference_strength_max ?? 5;
   if (enabled) {
     const maxMiB = Math.floor(options.reference_max_bytes / 1048576);
@@ -71,7 +80,7 @@ try {
   };
   model.addEventListener('change', updateModel);
   referenceType.addEventListener('change', updateReference);
-  const updateTranslator = () => { translator.disabled = raw.checked || !options.translator_enabled; };
+  const updateTranslator = () => { translator.disabled = raw.checked || !options.translator_enabled; updateReference(); };
   raw.addEventListener('change', updateTranslator);
   updateTranslator();
   updateModel();
@@ -98,6 +107,10 @@ clearReference.addEventListener('click', () => {
   if (options) updateReference();
   status.textContent = '已清除精准参考。';
 });
+clearVisionReference.addEventListener('click', () => {
+  visionReferenceImage.value = '';
+  status.textContent = '已清除普通参考图。';
+});
 for (const modeButton of modeButtons) {
   modeButton.addEventListener('click', async () => {
     const requested = modeButton.dataset.requestMode;
@@ -119,7 +132,11 @@ form.addEventListener('submit', async (event) => {
   if (!options || !requestMode || busy) return;
   const selectedType = referenceType.value;
   const file = referenceImage.files[0];
+  const visionFile = visionReferenceImage.files[0];
   const hasReference = Boolean(selectedType || file);
+  if (visionFile && (raw.checked || !options.translator_enabled)) {
+    status.textContent = '普通参考图需要启用翻译并关闭“使用原文”；请调整设置或清除普通参考图。'; return;
+  }
   if (hasReference && (requestMode !== 'native' || !options.precise_reference_available)) {
     status.textContent = '当前模式不支持所选参考图；请切换到可用的原生模式，或清除参考类型和图片。'; return;
   }
@@ -129,8 +146,8 @@ form.addEventListener('submit', async (event) => {
   if (hasReference && !options.families[model.value].reference_types.includes(selectedType)) {
     status.textContent = '当前模型不支持所选参考类型，请重新选择。'; return;
   }
-  if (hasReference && file.size > options.reference_max_bytes) {
-    status.textContent = '参考图片超过大小限制，请选择较小的图片。'; return;
+  if ((file?.size || 0) + (visionFile?.size || 0) > options.reference_max_bytes) {
+    status.textContent = '两张参考图合计超过大小限制，请选择较小的图片。'; return;
   }
   const strength = referenceStrength.valueAsNumber;
   if (hasReference && (!Number.isFinite(strength) || strength < 0 || strength > Number(referenceStrength.max))) {
@@ -156,7 +173,10 @@ form.addEventListener('submit', async (event) => {
     if (hasReference) {
       payload.reference_type = selectedType;
       payload.reference_strength = strength;
-      payload.reference_image = await new Promise((resolve, reject) => {
+    }
+    for (const [key, source] of [['reference_image', hasReference ? file : null], ['vision_reference_image', visionFile]]) {
+      if (!source) continue;
+      payload[key] = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => {
           const result = String(reader.result);
@@ -165,7 +185,7 @@ form.addEventListener('submit', async (event) => {
           else resolve(result.slice(comma + 1));
         };
         reader.onerror = () => reject(new Error('参考图片读取失败'));
-        reader.readAsDataURL(file);
+        reader.readAsDataURL(source);
       });
     }
     const task = await bridge.apiPost('canvas/generate', payload);
@@ -183,7 +203,7 @@ form.addEventListener('submit', async (event) => {
         image.hidden = false;
         download.hidden = false;
         document.querySelector('#empty').hidden = true;
-        status.textContent = ({not_applied: '图片已生成，但结果元数据显示精准参考未生效。', parameters_present: '图片已生成，结果元数据包含精准参考参数。', unknown: '图片已生成，无法从元数据确认精准参考是否生效。'})[result.precise_reference_status] || '生成完成';
+        status.textContent = ({not_applied: '图片已生成，但结果元数据显示精准参考未生效。', unknown: '图片已生成，无法从元数据确认精准参考是否生效。'})[result.precise_reference_status] || '生成完成';
         document.dispatchEvent(new Event('canvas-generated'));
         break;
       }

@@ -366,9 +366,15 @@ class OpenAIImagesProvider:
                 self.name, base, self.api_key, self.timeout
             ).generate(request)
         url = f"{base}/images/generations"
+        prompt = request.prompt
+        if request.character_prompts:
+            prompt += "\n\n" + "\n".join(
+                f"Character {index}: {caption}"
+                for index, caption in enumerate(request.character_prompts, 1)
+            )
         payload = {
             "model": request.model,
-            "prompt": request.prompt,
+            "prompt": prompt,
             "negative_prompt": request.negative_prompt,
             "size": request.size,
             "n": 1,
@@ -430,16 +436,32 @@ class OfficialNovelAIProvider:
                 "seed": secrets.randbelow(2**32),
                 "params_version": 4
                 if normalize_model(request.model).startswith("nai-diffusion-5-")
-                and (request.request_mode == "native" or request.precise_reference_type)
+                and (
+                    request.request_mode == "native"
+                    or request.precise_reference_type
+                    or request.character_prompts
+                )
                 else 3,
                 "cfg_rescale": request.cfg_rescale,
                 "v4_prompt": {
-                    "caption": {"base_caption": request.prompt, "char_captions": []},
+                    "caption": {
+                        "base_caption": request.prompt,
+                        "char_captions": [
+                            {"char_caption": caption, "centers": [{"x": 0.5, "y": 0.5}]}
+                            for caption in request.character_prompts
+                        ],
+                    },
                     "use_coords": False,
                     "use_order": True,
                 },
                 "v4_negative_prompt": {
-                    "caption": {"base_caption": request.negative_prompt, "char_captions": []},
+                    "caption": {
+                        "base_caption": request.negative_prompt,
+                        "char_captions": [
+                            {"char_caption": "", "centers": [{"x": 0.5, "y": 0.5}]}
+                            for _ in request.character_prompts
+                        ],
+                    },
                     "legacy_uc": False,
                 },
             },

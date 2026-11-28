@@ -120,6 +120,7 @@ class GenerationRequest:
     precise_reference_id: str = ""
     precise_reference_image: str = field(default="", repr=False)
     request_mode: str = ""
+    character_prompts: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]{1,120}", self.model):
@@ -138,6 +139,20 @@ class GenerationRequest:
         object.__setattr__(self, "noise_schedule", self.noise_schedule.strip())
         if self.action not in ("generate", "img2img"):
             raise ValueError("不支持的生成模式")
+        if not isinstance(self.character_prompts, (list, tuple)):
+            raise ValueError("角色提示词必须是列表")
+        if len(self.character_prompts) > 4 or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 2000
+            for item in self.character_prompts
+        ):
+            raise ValueError("角色提示词最多 4 条，每条应为 1–2000 字符")
+        object.__setattr__(
+            self, "character_prompts", tuple(item.strip() for item in self.character_prompts)
+        )
+        if self.character_prompts and (
+            self.action != "generate" or not reference_types(self.model)
+        ):
+            raise ValueError("角色提示词仅支持 NAI 4.5 或 NAI 5 文生图")
         if self.request_mode not in ("", "openai", "native"):
             raise ValueError("生图接口协议无效")
         if self.reference_id and not re.fullmatch(r"[a-f0-9]{64}", self.reference_id):

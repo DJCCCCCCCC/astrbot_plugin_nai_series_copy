@@ -7,7 +7,7 @@ def generation_args(text):
     flags = {}
     pattern = (
         r"(?:^|\s)--(raw|img2img|preset|model|size|steps|scale|count|"
-        r"strength|noise|image|route|ref|ref-strength)(?=\s|$)"
+        r"strength|noise|image|route|ref|ref-strength|参考|角色|服装)(?=\s|$)"
     )
     matches = list(re.finditer(pattern, text))
     if not matches:
